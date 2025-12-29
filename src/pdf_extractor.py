@@ -157,23 +157,38 @@ class PDFExtractor:
             page_text = page.get_text()
             
             # Strategy 2: Layout-preserving extraction (better for multi-column)
-            if len(page_text) < 500:  # If standard extraction is short, try layout
-                try:
-                    page_text_layout = page.get_text("layout")
-                    if len(page_text_layout) > len(page_text):
-                        page_text = page_text_layout
-                except:
-                    pass
+            # Always try layout mode for better quality, not just for short text
+            try:
+                page_text_layout = page.get_text("layout")
+                # Use layout if it's significantly better or if standard is short
+                if len(page_text_layout) > len(page_text) * 1.1 or len(page_text) < 500:
+                    page_text = page_text_layout
+            except:
+                pass
             
             # Strategy 3: Text blocks with coordinates (for better ordering)
-            if len(page_text) < 500:
+            # Use blocks for better multi-column handling
+            if len(page_text) < 1000:  # Try blocks if text seems incomplete
                 try:
                     blocks = page.get_text("blocks")
                     if blocks:
                         # Sort blocks by position (top to bottom, left to right)
-                        blocks_sorted = sorted(blocks, key=lambda b: (b[1], b[0]))
-                        page_text_blocks = '\n'.join([b[4] for b in blocks_sorted if b[4].strip()])
-                        if len(page_text_blocks) > len(page_text):
+                        # Group blocks by vertical position (same line)
+                        blocks_by_y = {}
+                        for block in blocks:
+                            y_pos = int(block[1] / 10)  # Group by 10-pixel bands
+                            if y_pos not in blocks_by_y:
+                                blocks_by_y[y_pos] = []
+                            blocks_by_y[y_pos].append(block)
+                        
+                        # Sort by Y position, then X position within each line
+                        sorted_blocks = []
+                        for y_pos in sorted(blocks_by_y.keys()):
+                            line_blocks = sorted(blocks_by_y[y_pos], key=lambda b: b[0])
+                            sorted_blocks.extend(line_blocks)
+                        
+                        page_text_blocks = '\n'.join([b[4] for b in sorted_blocks if b[4].strip()])
+                        if len(page_text_blocks) > len(page_text) * 0.9:  # Use if comparable or better
                             page_text = page_text_blocks
                 except:
                     pass
@@ -187,8 +202,12 @@ class PDFExtractor:
         
         doc.close()
         
+        # Post-process the full text for better quality
+        full_text_combined = '\n\n'.join(full_text)
+        full_text_combined = self._post_process_extracted_text(full_text_combined)
+        
         return {
-            'text': '\n\n'.join(full_text),
+            'text': full_text_combined,
             'metadata': metadata,
             'pages': text_pages,
             'method_used': 'pymupdf'
@@ -213,13 +232,26 @@ class PDFExtractor:
                 # Try standard extraction
                 page_text = page.extract_text() or ''
                 
-                # If poor extraction, try with layout
-                if len(page_text) < 500:
+                # Always try layout mode for better quality
+                try:
+                    # Try extracting with layout preservation
+                    page_text_layout = page.extract_text(layout=True) or ''
+                    # Use layout if it's better or standard is poor
+                    if len(page_text_layout) > len(page_text) * 1.05 or len(page_text) < 500:
+                        page_text = page_text_layout
+                except:
+                    pass
+                
+                # Try extracting words with positions for better ordering
+                if len(page_text) < 1000:
                     try:
-                        # Try extracting with layout preservation
-                        page_text_layout = page.extract_text(layout=True) or ''
-                        if len(page_text_layout) > len(page_text):
-                            page_text = page_text_layout
+                        words = page.extract_words()
+                        if words:
+                            # Sort words by position
+                            words_sorted = sorted(words, key=lambda w: (w['top'], w['left']))
+                            page_text_words = ' '.join([w['text'] for w in words_sorted])
+                            if len(page_text_words) > len(page_text) * 0.9:
+                                page_text = page_text_words
                     except:
                         pass
                 
@@ -243,8 +275,12 @@ class PDFExtractor:
                 })
                 full_text.append(page_text)
             
+            # Post-process the full text for better quality
+            full_text_combined = '\n\n'.join(full_text)
+            full_text_combined = self._post_process_extracted_text(full_text_combined)
+            
             return {
-                'text': '\n\n'.join(full_text),
+                'text': full_text_combined,
                 'metadata': metadata,
                 'pages': text_pages,
                 'method_used': 'pdfplumber'
@@ -282,10 +318,16 @@ class PDFExtractor:
                     pass
             
             # Clean up common pypdf extraction issues
-            # Fix broken words (common in pypdf)
-            page_text = re.sub(r'([a-z])([A-Z])', r'\1 \2', page_text)  # Fix camelCase breaks
-            # Fix broken numbers
+            # Fix broken words (common in pypdf) - but be careful with acronyms
+            # Only fix if it looks like a word break (lowercase followed by uppercase in middle of sentence)
+            page_text = re.sub(r'([a-z])([A-Z][a-z])', r'\1 \2', page_text)  # Fix word breaks
+            # Fix broken numbers (but preserve intentional spaces)
             page_text = re.sub(r'(\d)\s+(\d)', r'\1\2', page_text)  # Fix number breaks
+            # Fix broken punctuation
+            page_text = re.sub(r'([a-zA-Z])\s+([.,;:!?])', r'\1\2', page_text)  # Fix punctuation spacing
+            # Fix broken quotes
+            page_text = re.sub(r'([a-zA-Z])\s+(["\'])', r'\1\2', page_text)
+            page_text = re.sub(r'(["\'])\s+([a-zA-Z])', r'\1\2', page_text)
             
             text_pages.append({
                 'page': page_num + 1,
@@ -294,8 +336,12 @@ class PDFExtractor:
             })
             full_text.append(page_text)
         
+        # Post-process the full text for better quality
+        full_text_combined = '\n\n'.join(full_text)
+        full_text_combined = self._post_process_extracted_text(full_text_combined)
+        
         return {
-            'text': '\n\n'.join(full_text),
+            'text': full_text_combined,
             'metadata': metadata,
             'pages': text_pages,
             'method_used': 'pypdf'
@@ -343,7 +389,76 @@ class PDFExtractor:
         if len(sentences) < 3:  # Should have at least a few sentences
             return False
         
+        # Check for reasonable word-to-character ratio (should be mostly words, not symbols)
+        words = text.split()
+        if words:
+            avg_word_length = sum(len(w) for w in words) / len(words)
+            if avg_word_length < 2:  # Too many single characters
+                return False
+        
         return True
+    
+    def _post_process_extracted_text(self, text: str) -> str:
+        """
+        Post-process extracted text to improve quality.
+        Fixes common extraction issues.
+        """
+        if not text:
+            return text
+        
+        # Fix common extraction artifacts
+        
+        # 1. Fix broken sentences (period followed by lowercase)
+        text = re.sub(r'\.\s+([a-z])', r'. \1', text)  # Ensure space after period
+        
+        # 2. Fix broken words across lines (hyphen at end of line)
+        text = re.sub(r'-\s*\n\s*', '', text)  # Remove line breaks in hyphenated words
+        
+        # 3. Fix broken URLs and emails
+        text = re.sub(r'([a-zA-Z0-9])\s+([@.])\s+([a-zA-Z0-9])', r'\1\2\3', text)
+        
+        # 4. Fix broken mathematical expressions
+        # Fix spacing around operators
+        text = re.sub(r'([a-zA-Z0-9])\s*([+\-*/=<>])\s*([a-zA-Z0-9])', r'\1 \2 \3', text)
+        # But preserve subscripts/superscripts
+        text = re.sub(r'([a-zA-Z0-9])\s*_\s*([a-zA-Z0-9])', r'\1_\2', text)
+        text = re.sub(r'([a-zA-Z0-9])\s*\^\s*([a-zA-Z0-9])', r'\1^\2', text)
+        
+        # 5. Fix broken citations [1] -> [1] (remove spaces)
+        text = re.sub(r'\[\s*(\d+)\s*\]', r'[\1]', text)
+        
+        # 6. Fix broken references (e.g., "Figure 1" split across lines)
+        text = re.sub(r'(Figure|Table|Equation|Section|Algorithm)\s+\n\s*(\d+)', r'\1 \2', text, flags=re.IGNORECASE)
+        
+        # 7. Fix broken abbreviations (e.g., "e. g." -> "e.g.")
+        text = re.sub(r'\b([a-z])\.\s+([a-z])\.', r'\1.\2.', text)
+        
+        # 8. Fix multiple spaces (but preserve intentional spacing)
+        text = re.sub(r' {2,}', ' ', text)
+        
+        # 9. Fix broken parentheses and brackets
+        text = re.sub(r'\(\s+', '(', text)
+        text = re.sub(r'\s+\)', ')', text)
+        text = re.sub(r'\[\s+', '[', text)
+        text = re.sub(r'\s+\]', ']', text)
+        
+        # 10. Fix broken quotes
+        text = re.sub(r'"\s+([^"]+)\s+"', r'"\1"', text)
+        text = re.sub(r"'\s+([^']+)\s+'", r"'\1'", text)
+        
+        # 11. Normalize line breaks (preserve paragraph breaks)
+        text = re.sub(r'\n{3,}', '\n\n', text)  # Max 2 newlines
+        
+        # 12. Fix broken decimal numbers
+        text = re.sub(r'(\d)\s+\.\s+(\d)', r'\1.\2', text)
+        
+        # 13. Fix broken percentages
+        text = re.sub(r'(\d)\s+%', r'\1%', text)
+        
+        # 14. Fix broken units (e.g., "5 m s" -> "5 ms")
+        text = re.sub(r'(\d)\s+([a-z]{1,3})\s+([a-z])', r'\1 \2\3', text)
+        
+        return text
     
     def _score_extraction_quality(self, extracted: Dict) -> float:
         """
@@ -358,11 +473,15 @@ class PDFExtractor:
         
         score = 1.0
         
-        # Penalize for very short text
-        if len(text) < 1000:
+        # Penalize for very short text (more nuanced)
+        if len(text) < 500:
+            score -= 0.5
+        elif len(text) < 1000:
             score -= 0.3
+        elif len(text) < 3000:
+            score -= 0.15
         elif len(text) < 5000:
-            score -= 0.1
+            score -= 0.05
         
         # Penalize for empty pages
         empty_pages = sum(1 for p in pages if p.get('char_count', 0) < 50)
@@ -377,14 +496,28 @@ class PDFExtractor:
             elif avg_chars < 1000:
                 score -= 0.1
         
-        # Check for common academic paper structure
+        # Check for common academic paper structure (more thorough)
         text_lower = text.lower()
-        has_abstract = 'abstract' in text_lower[:2000]
-        has_introduction = 'introduction' in text_lower
-        has_references = 'reference' in text_lower or 'bibliography' in text_lower
+        # Check abstract in first 3000 chars (more lenient)
+        has_abstract = 'abstract' in text_lower[:3000] or 'summary' in text_lower[:3000]
+        # Check introduction (more lenient)
+        has_introduction = 'introduction' in text_lower or 'intro' in text_lower[:5000]
+        # Check references (more lenient)
+        has_references = 'reference' in text_lower or 'bibliography' in text_lower or 'references' in text_lower
         
-        structure_score = sum([has_abstract, has_introduction, has_references]) / 3.0
-        score = score * 0.7 + structure_score * 0.3  # Weight structure
+        # Check for other academic indicators
+        has_methods = 'method' in text_lower or 'methodology' in text_lower
+        has_results = 'result' in text_lower or 'experiment' in text_lower
+        has_conclusion = 'conclusion' in text_lower
+        
+        structure_elements = sum([has_abstract, has_introduction, has_references, has_methods, has_results, has_conclusion])
+        structure_score = structure_elements / 6.0
+        
+        # Weight structure more if text is short (structure is more important indicator)
+        if len(text) < 5000:
+            score = score * 0.6 + structure_score * 0.4
+        else:
+            score = score * 0.7 + structure_score * 0.3
         
         return max(0.0, min(1.0, score))
     
