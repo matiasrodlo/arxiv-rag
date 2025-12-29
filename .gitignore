@@ -45,6 +45,8 @@ pdfs/
 data/
 *.pdf
 *.txt
+!requirements.txt
+!paper_ids.txt
 
 # Logs
 logs/

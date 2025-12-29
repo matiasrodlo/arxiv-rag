@@ -1,0 +1,35 @@
+# PDF Processing
+PyMuPDF>=1.23.0
+pdfplumber>=0.10.0
+pypdf>=3.17.0
+pdf2image>=1.16.3
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# NLP and Embeddings
+sentence-transformers>=2.2.2
+transformers>=4.35.0
+torch>=2.1.0
+numpy>=1.24.0
+
+# Vector Databases
+chromadb>=0.4.15
+qdrant-client>=1.6.9
+
+# Search and Ranking
+rank-bm25>=0.2.2
+
+# Utilities
+tqdm>=4.66.0
+loguru>=0.7.2
+pydantic>=2.5.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# Data Processing
+pandas>=2.1.0
+pyarrow>=14.0.0
+
+# Optional: For better performance
+faiss-cpu>=1.7.4
+
