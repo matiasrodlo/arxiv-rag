@@ -1,0 +1,115 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+._*
+
+# Data directories
+pdfs/
+data/
+*.pdf
+*.txt
+
+# Logs
+logs/
+*.log
+
+# Vector databases
+vector_db/
+*.db
+*.sqlite
+*.sqlite3
+
+# Extracted text and processed data
+extracted_text/
+processed/
+*.json
+!config.yaml
+
+# Test results
+test_results/
+batch_test_*
+extraction_quality_report.json
+test_metadata_sample.json
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Paper IDs (can be regenerated)
+paper_ids.txt
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+
