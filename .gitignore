@@ -109,6 +109,9 @@ dmypy.json
 # Paper IDs (can be regenerated)
 paper_ids.txt
 
+# Scripts directory (if you want to ignore generated scripts)
+# scripts/
+
 # Temporary files
 *.tmp
 *.temp
