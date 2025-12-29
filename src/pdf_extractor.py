@@ -82,17 +82,37 @@ class PDFExtractor:
         }
         
         # Try each extraction method in order
+        best_result = None
+        best_score = 0
+        
         for method in self.extraction_methods:
             try:
                 extracted = method(str(pdf_path))
                 if extracted and self._validate_extraction(extracted):
-                    result.update(extracted)
-                    result['success'] = True
-                    logger.info(f"Successfully extracted {pdf_path.name} using {result['method_used']}")
-                    return result
+                    # Score the extraction quality
+                    score = self._score_extraction_quality(extracted)
+                    
+                    # Keep the best extraction
+                    if score > best_score:
+                        best_score = score
+                        best_result = extracted
+                        
+                    # If we get a very good extraction, use it immediately
+                    if score >= 0.9:
+                        result.update(extracted)
+                        result['success'] = True
+                        logger.info(f"Successfully extracted {pdf_path.name} using {result['method_used']} (quality: {score:.2f})")
+                        return result
             except Exception as e:
                 logger.warning(f"Extraction method {method.__name__} failed: {e}")
                 continue
+        
+        # Use the best extraction found
+        if best_result:
+            result.update(best_result)
+            result['success'] = True
+            logger.info(f"Successfully extracted {pdf_path.name} using {result['method_used']} (quality: {best_score:.2f})")
+            return result
         
         # Try OCR as last resort
         if self.enable_ocr and result['text'] == '':
@@ -112,7 +132,7 @@ class PDFExtractor:
         return result
     
     def _extract_pymupdf(self, pdf_path: str) -> Optional[Dict]:
-        """Extract using PyMuPDF (fitz)."""
+        """Extract using PyMuPDF (fitz) - best quality extraction."""
         doc = fitz.open(pdf_path)
         text_pages = []
         full_text = []
@@ -128,9 +148,36 @@ class PDFExtractor:
             'page_count': len(doc)
         }
         
+        # Use improved text extraction with layout preservation
         for page_num in range(len(doc)):
             page = doc[page_num]
+            
+            # Try multiple extraction strategies for better quality
+            # Strategy 1: Standard extraction
             page_text = page.get_text()
+            
+            # Strategy 2: Layout-preserving extraction (better for multi-column)
+            if len(page_text) < 500:  # If standard extraction is short, try layout
+                try:
+                    page_text_layout = page.get_text("layout")
+                    if len(page_text_layout) > len(page_text):
+                        page_text = page_text_layout
+                except:
+                    pass
+            
+            # Strategy 3: Text blocks with coordinates (for better ordering)
+            if len(page_text) < 500:
+                try:
+                    blocks = page.get_text("blocks")
+                    if blocks:
+                        # Sort blocks by position (top to bottom, left to right)
+                        blocks_sorted = sorted(blocks, key=lambda b: (b[1], b[0]))
+                        page_text_blocks = '\n'.join([b[4] for b in blocks_sorted if b[4].strip()])
+                        if len(page_text_blocks) > len(page_text):
+                            page_text = page_text_blocks
+                except:
+                    pass
+            
             text_pages.append({
                 'page': page_num + 1,
                 'text': page_text,
@@ -163,7 +210,32 @@ class PDFExtractor:
             }
             
             for page_num, page in enumerate(pdf.pages):
+                # Try standard extraction
                 page_text = page.extract_text() or ''
+                
+                # If poor extraction, try with layout
+                if len(page_text) < 500:
+                    try:
+                        # Try extracting with layout preservation
+                        page_text_layout = page.extract_text(layout=True) or ''
+                        if len(page_text_layout) > len(page_text):
+                            page_text = page_text_layout
+                    except:
+                        pass
+                
+                # Extract tables if present (add as structured text)
+                tables = page.extract_tables()
+                if tables:
+                    table_texts = []
+                    for table in tables:
+                        # Convert table to readable text
+                        for row in table:
+                            if row:
+                                row_text = ' | '.join([str(cell) if cell else '' for cell in row])
+                                table_texts.append(row_text)
+                    if table_texts:
+                        page_text += '\n\nTables:\n' + '\n'.join(table_texts)
+                
                 text_pages.append({
                     'page': page_num + 1,
                     'text': page_text,
@@ -179,7 +251,7 @@ class PDFExtractor:
             }
     
     def _extract_pypdf(self, pdf_path: str) -> Optional[Dict]:
-        """Extract using pypdf (lightweight fallback)."""
+        """Extract using pypdf (lightweight fallback) with improved extraction."""
         reader = PdfReader(pdf_path)
         text_pages = []
         full_text = []
@@ -196,7 +268,25 @@ class PDFExtractor:
         metadata['page_count'] = len(reader.pages)
         
         for page_num, page in enumerate(reader.pages):
+            # Try standard extraction first
             page_text = page.extract_text() or ''
+            
+            # If extraction is poor, try with layout hints
+            if len(page_text) < 500 and hasattr(page, 'extract_text'):
+                try:
+                    # Try extraction with different parameters
+                    page_text_alt = page.extract_text(extraction_mode="layout") or ''
+                    if len(page_text_alt) > len(page_text):
+                        page_text = page_text_alt
+                except:
+                    pass
+            
+            # Clean up common pypdf extraction issues
+            # Fix broken words (common in pypdf)
+            page_text = re.sub(r'([a-z])([A-Z])', r'\1 \2', page_text)  # Fix camelCase breaks
+            # Fix broken numbers
+            page_text = re.sub(r'(\d)\s+(\d)', r'\1\2', page_text)  # Fix number breaks
+            
             text_pages.append({
                 'page': page_num + 1,
                 'text': page_text,
@@ -241,7 +331,62 @@ class PDFExtractor:
         # Check if text is mostly whitespace or special characters
         if len(re.sub(r'\s+', '', text)) < min_length * 0.5:
             return False
+        
+        # Additional quality checks
+        # Check for reasonable word count (not just symbols)
+        words = text.split()
+        if len(words) < min_length // 10:  # At least some words
+            return False
+        
+        # Check for reasonable sentence structure
+        sentences = text.split('.')
+        if len(sentences) < 3:  # Should have at least a few sentences
+            return False
+        
         return True
+    
+    def _score_extraction_quality(self, extracted: Dict) -> float:
+        """
+        Score extraction quality (0-1).
+        Higher score = better quality.
+        """
+        text = extracted.get('text', '')
+        pages = extracted.get('pages', [])
+        
+        if not text or not pages:
+            return 0.0
+        
+        score = 1.0
+        
+        # Penalize for very short text
+        if len(text) < 1000:
+            score -= 0.3
+        elif len(text) < 5000:
+            score -= 0.1
+        
+        # Penalize for empty pages
+        empty_pages = sum(1 for p in pages if p.get('char_count', 0) < 50)
+        if empty_pages > 0:
+            score -= (empty_pages / len(pages)) * 0.2
+        
+        # Penalize for low average chars per page
+        if pages:
+            avg_chars = sum(p.get('char_count', 0) for p in pages) / len(pages)
+            if avg_chars < 500:
+                score -= 0.2
+            elif avg_chars < 1000:
+                score -= 0.1
+        
+        # Check for common academic paper structure
+        text_lower = text.lower()
+        has_abstract = 'abstract' in text_lower[:2000]
+        has_introduction = 'introduction' in text_lower
+        has_references = 'reference' in text_lower or 'bibliography' in text_lower
+        
+        structure_score = sum([has_abstract, has_introduction, has_references]) / 3.0
+        score = score * 0.7 + structure_score * 0.3  # Weight structure
+        
+        return max(0.0, min(1.0, score))
     
     def clean_text(self, text: str, remove_headers_footers: bool = True) -> str:
         """
