@@ -63,12 +63,12 @@ class RAGPipeline:
         self.embedder = None
         if self.config.get('embeddings', {}).get('generate_during_processing', True):
             try:
-        self.embedder = Embedder(
-            model_name=self.config['embeddings']['model'],
-            batch_size=self.config['embeddings']['batch_size'],
-            device=self.config['embeddings']['device'],
-            normalize_embeddings=self.config['embeddings']['normalize_embeddings']
-        )
+                self.embedder = Embedder(
+                    model_name=self.config['embeddings']['model'],
+                    batch_size=self.config['embeddings']['batch_size'],
+                    device=self.config['embeddings']['device'],
+                    normalize_embeddings=self.config['embeddings']['normalize_embeddings']
+                )
             except ImportError:
                 logger.warning("Embeddings not available, will skip embedding generation during processing")
         
@@ -76,13 +76,13 @@ class RAGPipeline:
         self.vector_store = None
         if self.config.get('vector_db', {}).get('add_during_processing', True):
             try:
-        self.vector_store = VectorStore(
-            db_type=self.config['vector_db']['type'],
-            collection_name=self.config['vector_db']['collection_name'],
-            persist_directory=self.config['vector_db'].get('persist_directory'),
-            qdrant_host=self.config['vector_db'].get('qdrant_host', 'localhost'),
-            qdrant_port=self.config['vector_db'].get('qdrant_port', 6333)
-        )
+                self.vector_store = VectorStore(
+                    db_type=self.config['vector_db']['type'],
+                    collection_name=self.config['vector_db']['collection_name'],
+                    persist_directory=self.config['vector_db'].get('persist_directory'),
+                    qdrant_host=self.config['vector_db'].get('qdrant_host', 'localhost'),
+                    qdrant_port=self.config['vector_db'].get('qdrant_port', 6333)
+                )
             except ImportError:
                 logger.warning("Vector store not available, will skip vector store addition during processing")
         
@@ -218,6 +218,15 @@ class RAGPipeline:
         Returns:
             Dictionary with processing results or None if failed
         """
+        # Skip macOS resource fork files
+        if paper_id.startswith('._'):
+            logger.debug(f"Skipping macOS resource fork file: {paper_id}")
+            return {
+                'paper_id': paper_id,
+                'success': False,
+                'error': 'macOS resource fork file (not a real PDF)'
+            }
+        
         pdf_path = self.pdf_dir / f"{paper_id}.pdf"
         metadata_path = self.metadata_dir / f"{paper_id}.txt"
         
@@ -257,7 +266,7 @@ class RAGPipeline:
             chunks_with_embeddings = chunks
             if self.embedder:
                 try:
-            chunks_with_embeddings = self.embedder.embed_chunks(chunks, show_progress=False)
+                    chunks_with_embeddings = self.embedder.embed_chunks(chunks, show_progress=False)
                 except Exception as e:
                     logger.warning(f"Embedding generation failed: {e}, continuing without embeddings")
                     chunks_with_embeddings = chunks
@@ -265,7 +274,7 @@ class RAGPipeline:
             # Step 6: Add to vector store (if vector store is available)
             if self.vector_store:
                 try:
-            self.vector_store.add_chunks(chunks_with_embeddings)
+                    self.vector_store.add_chunks(chunks_with_embeddings)
                 except Exception as e:
                     logger.warning(f"Vector store addition failed: {e}, continuing")
             
@@ -419,6 +428,13 @@ class RAGPipeline:
         batch_size = batch_size or self.config['processing']['batch_size']
         num_workers = num_workers or self.config['processing']['num_workers']
         
+        # Filter out macOS resource fork files (._*)
+        original_count = len(paper_ids)
+        paper_ids = [pid for pid in paper_ids if not pid.startswith('._')]
+        macos_filtered = original_count - len(paper_ids)
+        if macos_filtered > 0:
+            logger.info(f"Filtered out {macos_filtered} macOS resource fork files")
+        
         # Filter out already processed papers
         skipped = 0
         if skip_processed:
@@ -519,9 +535,9 @@ class RAGPipeline:
                     batch_size_db = 50  # Write to DB every 50 papers
                     
                     for paper_id in batch:
-                result = self.process_paper(paper_id)
-                if result and result.get('success'):
-                    results['successful'] += 1
+                        result = self.process_paper(paper_id)
+                        if result and result.get('success'):
+                            results['successful'] += 1
                             batch_db_records.append((
                                 paper_id, 'success',
                                 result.get('num_chunks', 0),
@@ -610,13 +626,13 @@ class RAGPipeline:
                                         'error': error_msg
                                     })
                             except Exception as e:
-                    results['failed'] += 1
+                                results['failed'] += 1
                                 error_msg = str(e)
                                 batch_db_records.append((
                                     paper_id, 'failed', 0, 0, error_msg
                                 ))
-                        results['errors'].append({
-                            'paper_id': paper_id,
+                                results['errors'].append({
+                                    'paper_id': paper_id,
                                     'error': error_msg
                                 })
                             finally:
