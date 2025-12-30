@@ -23,23 +23,23 @@ text_processing:
   normalize_whitespace: true
   fix_encoding: true
   improve_formulas: true  # Improve mathematical formula formatting
-  min_chunk_size: 100  # Minimum characters per chunk
-  max_chunk_size: 1000  # Maximum characters per chunk
-  chunk_overlap: 200  # Overlap between chunks in characters
+  min_chunk_size: 200  # Minimum characters per chunk (increased for better quality)
+  max_chunk_size: 2000  # Maximum characters per chunk (increased for better context, was 1000)
+  chunk_overlap: 400  # Overlap between chunks in characters (increased, was 200)
   preserve_sections: true
 
 # Chunking
 chunking:
   method: "semantic"  # semantic, fixed, sentence
-  chunk_size: 512  # tokens
-  chunk_overlap: 50  # tokens
+  chunk_size: 1024  # tokens (increased for better context, was 512)
+  chunk_overlap: 100  # tokens (increased for better continuity, was 50)
   model: "sentence-transformers/all-MiniLM-L6-v2"  # For semantic chunking
 
 # Embeddings
 embeddings:
-  model: "sentence-transformers/all-mpnet-base-v2"
-  batch_size: 32
-  device: "cpu"  # cpu, cuda, mps
+  model: "sentence-transformers/all-mpnet-base-v2"  # High-quality model for 128GB RAM
+  batch_size: 128  # Optimized for M4 Max with 128GB RAM (was 32)
+  device: "mps"  # Use Metal Performance Shaders (Apple GPU) for maximum speed
   normalize_embeddings: true
 
 # Vector Database
@@ -62,8 +62,8 @@ retrieval:
 
 # Processing
 processing:
-  batch_size: 100  # Papers per batch
-  num_workers: 4  # Parallel workers
+  batch_size: 500  # Papers per batch (optimized for 128GB RAM, was 100)
+  num_workers: 12  # Parallel workers (12 performance cores, was 4)
   max_retries: 3
   retry_delay: 1  # seconds
 
