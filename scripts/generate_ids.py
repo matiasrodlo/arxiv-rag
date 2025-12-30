@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Generate paper IDs file from PDFs in the pdfs folder.
+Generate paper IDs file from PDFs in the papers folder.
 """
 
 import argparse
 from pathlib import Path
 
 
-def generate_paper_ids(pdf_dir: str = "pdfs", output_file: str = "paper_ids.txt"):
+def generate_paper_ids(pdf_dir: str = "papers", output_file: str = "paper_ids.txt"):
     """
     Generate a list of paper IDs from PDF files.
     
@@ -49,8 +49,8 @@ def main():
     parser.add_argument(
         '--pdf-dir',
         type=str,
-        default='pdfs',
-        help='Directory containing PDF files (default: pdfs)'
+        default='papers',
+        help='Directory containing PDF files (default: papers)'
     )
     parser.add_argument(
         '--output',

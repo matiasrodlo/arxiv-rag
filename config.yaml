@@ -2,11 +2,11 @@
 
 # Paths
 paths:
-  pdf_dir: "pdfs"
-  metadata_dir: "pdfs"
-  output_dir: "data/processed"
+  pdf_dir: "papers"
+  metadata_dir: "papers"
+  output_dir: "output"
   vector_db_path: "data/vector_db"
-  extracted_text_dir: "data/extracted_text"
+  extracted_text_dir: "output"
 
 # PDF Extraction
 pdf_extraction:

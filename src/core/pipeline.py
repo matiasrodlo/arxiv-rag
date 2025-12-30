@@ -11,10 +11,10 @@ from tqdm import tqdm
 from loguru import logger
 import yaml
 
-from .pdf_extractor import PDFExtractor, load_metadata
-from .text_processor import TextProcessor, TextChunker
-from .embedder import Embedder
-from .vector_store import VectorStore
+from ..extractors.pdf_extractor import PDFExtractor, load_metadata
+from ..processors.text_processor import TextProcessor, TextChunker
+from ..embeddings.embedder import Embedder
+from ..storage.vector_store import VectorStore
 
 
 class RAGPipeline:
@@ -126,16 +126,122 @@ class RAGPipeline:
             # Step 6: Add to vector store
             self.vector_store.add_chunks(chunks_with_embeddings)
             
-            # Save extracted text for reference
+            # Step 7: Extract sections for better structure (with page information)
+            pages_data = extraction_result.get('pages', [])
+            sections = self.text_processor.extract_sections(cleaned_text, pages=pages_data)
+            
+            # Step 8: Map chunks to sections for better metadata (optimized with binary search)
+            # Pre-build section boundaries for faster lookup
+            section_boundaries = [(s['start_char'], s['end_char'], s['name']) for s in sections]
+            section_boundaries.sort()  # Sort by start_char
+            
+            def find_section_for_position(pos: int) -> str:
+                """Find which section a character position belongs to (binary search)."""
+                left, right = 0, len(section_boundaries) - 1
+                while left <= right:
+                    mid = (left + right) // 2
+                    start, end, name = section_boundaries[mid]
+                    if start <= pos < end:
+                        return name
+                    elif pos < start:
+                        right = mid - 1
+                    else:
+                        left = mid + 1
+                return 'Unknown'
+            
+            # Pre-build page boundaries for faster lookup
+            page_boundaries = []
+            current_pos = 0
+            for page in pages_data:
+                page_text = page.get('text', '')
+                page_length = len(page_text)
+                page_boundaries.append((current_pos, current_pos + page_length, page.get('page', 1)))
+                current_pos += page_length + 2  # +2 for page separator
+            
+            def find_page_for_position(pos: int) -> int:
+                """Find which page a character position belongs to (binary search)."""
+                left, right = 0, len(page_boundaries) - 1
+                while left <= right:
+                    mid = (left + right) // 2
+                    start, end, page_num = page_boundaries[mid]
+                    if start <= pos < end:
+                        return page_num
+                    elif pos < start:
+                        right = mid - 1
+                    else:
+                        left = mid + 1
+                return page_boundaries[-1][2] if page_boundaries else 1
+            
+            # Step 9: Prepare enhanced JSON structure optimized for RAG
+            chunk_start_positions = []
+            current_pos = 0
+            for chunk in chunks:
+                chunk_start_positions.append(current_pos)
+                current_pos += len(chunk['text']) + 1  # +1 for separator
+            
+            extracted_data = {
+                'paper_id': paper_id,
+                'metadata': {
+                    **metadata,
+                    'extraction_method': extraction_result['method_used'],
+                    'quality_score': extraction_result.get('quality_score', 0.0),
+                    'pdf_type': extraction_result.get('pdf_type', 'unknown'),
+                    'num_pages': len(pages_data),
+                    'text_length': len(cleaned_text),
+                    'extraction_date': extraction_result.get('extraction_date', ''),
+                },
+                'text': {
+                    'full': cleaned_text,
+                    'by_page': [
+                        {
+                            'page': p.get('page', i + 1),
+                            'text': p.get('text', ''),
+                            'char_count': p.get('char_count', len(p.get('text', '')))
+                        }
+                        for i, p in enumerate(pages_data)
+                    ],
+                    'sections': [
+                        {
+                            'name': s.get('name', ''),
+                            'text': s.get('text', ''),
+                            'start_char': s.get('start_char', 0),
+                            'end_char': s.get('end_char', 0),
+                            'page': s.get('page', 1)
+                        }
+                        for s in sections
+                    ]
+                },
+                'chunks': [
+                    {
+                        'chunk_id': f"{paper_id}_chunk_{i}",
+                        'text': chunk['text'],
+                        'metadata': {
+                            **chunk.get('metadata', {}),
+                            'chunk_index': i,
+                            'chunk_length': len(chunk['text']),
+                            'paper_id': paper_id,
+                            'section': find_section_for_position(chunk_start_positions[i]) if i < len(chunk_start_positions) else 'Unknown',
+                            'page': find_page_for_position(chunk_start_positions[i]) if i < len(chunk_start_positions) else 1
+                        }
+                    }
+                    for i, chunk in enumerate(chunks_with_embeddings)
+                ],
+                'statistics': {
+                    'num_chunks': len(chunks),
+                    'num_pages': len(pages_data),
+                    'num_sections': len(sections),
+                    'total_chars': len(cleaned_text),
+                    'avg_chunk_size': sum(len(c['text']) for c in chunks) / len(chunks) if chunks else 0,
+                    'chunking_method': self.chunker.method
+                }
+            }
+            
+            # Save enhanced JSON structure
             extracted_text_path = self.extracted_text_dir / f"{paper_id}.json"
             with open(extracted_text_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'paper_id': paper_id,
-                    'metadata': metadata,
-                    'text': cleaned_text,
-                    'num_chunks': len(chunks),
-                    'extraction_method': extraction_result['method_used']
-                }, f, indent=2, ensure_ascii=False)
+                json.dump(extracted_data, f, indent=2, ensure_ascii=False)
+            
+            logger.debug(f"Saved enhanced JSON extraction for {paper_id}")
             
             return {
                 'paper_id': paper_id,

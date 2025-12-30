@@ -1,6 +1,6 @@
 # ArXiv CS RAG System
 
-Production-ready RAG (Retrieval-Augmented Generation) system for ArXiv Computer Science papers.
+RAG (Retrieval-Augmented Generation) system for the full arXiv Computer Science corpus (~800,000 papers), designed for the [Veritas Autonomous Research Assistant](https://github.com/matiasrodlo/veritas).
 
 ## Quick Start
 
@@ -9,47 +9,49 @@ Production-ready RAG (Retrieval-Augmented Generation) system for ArXiv Computer 
 pip install -r requirements.txt
 ```
 
-2. Generate paper IDs (if needed):
+2. Process papers:
 ```bash
-python scripts/generate_paper_ids.py
+python run.py
 ```
 
-3. Process papers:
+3. Query the RAG system:
 ```bash
-python run_pipeline.py
-```
-
-4. Query the system:
-```bash
-python query.py "your search query"
+python query.py "your query here"
 ```
 
 ## Project Structure
 
 ```
 arxiv-rag/
-├── config.yaml          # Configuration
-├── requirements.txt     # Dependencies
-├── run_pipeline.py      # Main pipeline script
-├── query.py             # Query interface
-├── scripts/             # Utility scripts
-│   └── generate_paper_ids.py
-└── src/                 # Source code
-    ├── pdf_extractor.py
-    ├── text_processor.py
-    ├── formula_processor.py
-    ├── embedder.py
-    ├── vector_store.py
-    ├── retriever.py
-    └── pipeline.py
+├── run.py              # Main pipeline runner
+├── query.py            # Query interface
+├── config.yaml         # Configuration
+├── paper_ids.txt       # Paper ID list
+│
+├── src/                # Source code
+│   ├── core/          # Pipeline orchestration
+│   ├── extractors/    # PDF & formula extraction
+│   ├── processors/     # Text processing & chunking
+│   ├── embeddings/     # Embedding generation
+│   ├── storage/        # Vector database
+│   └── retrieval/      # Search & retrieval
+│
+├── papers/             # PDF files
+├── output/             # Extracted JSON files
+├── data/               # Processed data & vector DB
+└── logs/               # Application logs
 ```
 
-## Configuration
+## Features
 
-Edit `config.yaml` to customize:
-- PDF extraction settings
-- Chunking strategy
-- Embedding model
-- Vector database type
-- Retrieval parameters
+- Multi-library PDF extraction (PyMuPDF, pdfplumber, pypdf)
+- OCR support for scanned PDFs
+- Sentence-aware chunking for optimal RAG performance
+- Enhanced section detection with fuzzy matching
+- Quality scoring and validation
+- Structured JSON output with page-level and section metadata
 
+## Scripts
+
+- `scripts/generate_ids.py` - Generate paper ID list from PDFs
+- `scripts/analyze.py` - Analyze JSON files for RAG suitability
