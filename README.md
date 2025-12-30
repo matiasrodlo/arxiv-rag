@@ -1,6 +1,6 @@
 # ArXiv CS RAG System
 
-RAG (Retrieval-Augmented Generation) system for the full arXiv Computer Science corpus (~800,000 papers), designed for the [Veritas Autonomous Research Assistant](https://github.com/matiasrodlo/veritas).
+RAG (Retrieval-Augmented Generation) system for the full arXiv Computer Science corpus (~800,000 papers), designed for the [Veritas: A Scientist for Autonomous Research](https://github.com/matiasrodlo/veritas).
 
 ## Quick Start
 

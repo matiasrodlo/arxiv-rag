@@ -406,15 +406,14 @@ class PDFExtractor:
                 if page_text_layout:
                     if not page_text or len(page_text_layout) > len(page_text) * 1.05:
                         page_text = page_text_layout
-            except Exception as e:
-                logger.debug(f"Layout extraction failed for page {page_num + 1}: {e}")
+            except Exception:
+                pass  # Fallback to standard extraction
         
         # Strategy 3: Standard extraction as fallback
         if not page_text:
             try:
                 page_text = page.get_text()
-            except Exception as e:
-                logger.debug(f"Standard extraction failed for page {page_num + 1}: {e}")
+            except Exception:
                 page_text = ''
         
         # Strategy 4: Extract tables using PyMuPDF (if available)
@@ -440,8 +439,8 @@ class PDFExtractor:
                     page_text_blocks = self._reconstruct_text_from_blocks(blocks)
                     if page_text_blocks and len(page_text_blocks) > len(page_text) * 0.9:
                         page_text = page_text_blocks
-            except Exception as e:
-                logger.debug(f"Block extraction failed for page {page_num + 1}: {e}")
+            except Exception:
+                pass  # Block extraction is optional
         
         # Strategy 6: Try rawdict for very structured documents (skip for parallel to save time)
         if len(page_text) < 500 and not self.enable_parallel:
@@ -451,8 +450,8 @@ class PDFExtractor:
                     page_text_raw = self._reconstruct_text_from_dict(rawdict)
                     if page_text_raw and len(page_text_raw) > len(page_text):
                         page_text = page_text_raw
-            except Exception as e:
-                logger.debug(f"Rawdict extraction failed for page {page_num + 1}: {e}")
+            except Exception:
+                pass  # Rawdict extraction is optional
         
         return page_text
     
@@ -469,11 +468,9 @@ class PDFExtractor:
                         table_data = table.extract()
                         if table_data and len(table_data) > 0:
                             tables.append(table_data)
-                    except Exception as e:
-                        logger.debug(f"Error extracting table data: {e}")
+                    except Exception:
                         continue
-        except Exception as e:
-            logger.debug(f"find_tables not available or failed: {e}")
+        except Exception:
             # Fallback: Try to detect tables from text blocks
             try:
                 blocks = page.get_text("blocks")
@@ -482,8 +479,8 @@ class PDFExtractor:
                     table_blocks = self._detect_table_blocks(blocks)
                     if table_blocks:
                         tables.extend(table_blocks)
-            except Exception as e2:
-                logger.debug(f"Table block detection failed: {e2}")
+            except Exception:
+                pass  # Table block detection is optional
         
         return tables
     
@@ -751,8 +748,8 @@ class PDFExtractor:
                     page_text_layout = page.extract_text(layout=True) or ''
                     if page_text_layout:
                         page_text = page_text_layout
-                except Exception as e:
-                    logger.debug(f"Layout extraction failed for page {page_num + 1}: {e}")
+                except Exception:
+                    pass  # Fallback to standard extraction
                 
                 # Strategy 2: Standard extraction as comparison
                 if not page_text or len(page_text) < 500:
@@ -760,8 +757,8 @@ class PDFExtractor:
                         page_text_standard = page.extract_text() or ''
                         if page_text_standard and len(page_text_standard) > len(page_text) * 1.05:
                             page_text = page_text_standard
-                    except Exception as e:
-                        logger.debug(f"Standard extraction failed for page {page_num + 1}: {e}")
+                    except Exception:
+                        pass  # Fallback already attempted
                 
                 # Strategy 3: Word-level extraction with improved ordering (for complex layouts)
                 if len(page_text) < 1000:
@@ -792,8 +789,8 @@ class PDFExtractor:
                             page_text_words = self._reconstruct_text_from_words(sorted_words)
                             if page_text_words and len(page_text_words) > len(page_text) * 0.9:
                                 page_text = page_text_words
-                    except Exception as e:
-                        logger.debug(f"Word extraction failed for page {page_num + 1}: {e}")
+                    except Exception:
+                        pass  # Word extraction is optional
                 
                 # Strategy 4: Extract tables with enhanced formatting
                 try:
@@ -806,8 +803,8 @@ class PDFExtractor:
                                 page_text += '\n\n' + table_text
                             else:
                                 page_text = table_text
-                except Exception as e:
-                    logger.debug(f"Table extraction failed for page {page_num + 1}: {e}")
+                except Exception:
+                    pass  # Table extraction is optional
                 
                 text_pages.append({
                     'page': page_num + 1,

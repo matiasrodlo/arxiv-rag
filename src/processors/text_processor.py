@@ -202,14 +202,28 @@ class TextProcessor:
         # Pre-compile patterns for better performance
         compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in section_patterns]
         
-        # Limit processing to first 10000 lines to avoid performance issues
-        max_lines = min(10000, len(lines))
+        # Limit processing to first 5000 lines to avoid performance issues (reduced from 10000)
+        max_lines = min(5000, len(lines))
         # #region agent log
-        debug_log("text_processor.py:165", "Starting section loop", {"max_lines": max_lines}, "A")
+        debug_log("text_processor.py:206", "Starting section loop", {"max_lines": max_lines, "total_lines": len(lines)}, "E")
         # #endregion
         
-        page_find_calls = 0
+        last_log_time = time.time()
         for line_idx, line in enumerate(lines[:max_lines]):
+            # Log progress every 1000 lines to detect if stuck
+            if line_idx > 0 and line_idx % 1000 == 0:
+                current_time = time.time()
+                elapsed = current_time - last_log_time
+                # #region agent log
+                debug_log("text_processor.py:213", "Section loop progress", {"line_idx": line_idx, "elapsed_since_last": elapsed, "sections_found": len(sections)}, "E")
+                # #endregion
+                last_log_time = current_time
+                
+                # Safety: if processing more than 1 second per 1000 lines, something is wrong
+                if elapsed > 1.0:
+                    # #region agent log
+                    debug_log("text_processor.py:213", "WARNING: Slow section processing", {"line_idx": line_idx, "elapsed": elapsed}, "E")
+                    # #endregion
             line_stripped = line.strip()
             line_start_char = char_position
             
@@ -239,24 +253,16 @@ class TextProcessor:
                         # Normalize section name
                         section_name = section_name.strip().rstrip(':').strip()
                         
-                        # Save previous section
+                        # Save previous section (page number will be calculated later in batch)
                         if current_section['content_lines']:
                             section_text = '\n'.join(current_section['content_lines']).strip()
                             if section_text:  # Only add non-empty sections
-                                page_find_start = time.time()
-                                page_num = self._find_page_for_position(current_section['start_char'], pages) if pages else 1
-                                page_find_time = time.time() - page_find_start
-                                page_find_calls += 1
-                                # #region agent log
-                                debug_log("text_processor.py:175", "_find_page_for_position call", {"time": page_find_time, "call_number": page_find_calls, "section_name": current_section['name']}, "B")
-                                # #endregion
-                                
                                 sections.append({
                                     'name': current_section['name'],
                                     'text': section_text,
                                     'start_char': current_section['start_char'],
                                     'end_char': char_position,
-                                    'page': page_num
+                                    'page': 1  # Temporary, will be updated in batch
                                 })
                         
                         # Start new section
@@ -324,13 +330,12 @@ class TextProcessor:
                             if current_section['content_lines']:
                                 section_text = '\n'.join(current_section['content_lines']).strip()
                                 if section_text:
-                                    page_num = self._find_page_for_position(current_section['start_char'], pages) if pages else 1
                                     sections.append({
                                         'name': current_section['name'],
                                         'text': section_text,
                                         'start_char': current_section['start_char'],
                                         'end_char': char_position,
-                                        'page': page_num
+                                        'page': 1  # Temporary, will be updated in batch
                                     })
                             current_section = {
                                 'name': 'References',
@@ -343,24 +348,16 @@ class TextProcessor:
                     if not is_section_header:
                         for key, normalized_name in fuzzy_sections.items():
                             if line_lower == key or line_lower.startswith(key + ' ') or line_lower.endswith(' ' + key):
-                                # Save previous section
+                                # Save previous section (page number will be calculated later in batch)
                                 if current_section['content_lines']:
                                     section_text = '\n'.join(current_section['content_lines']).strip()
                                     if section_text:
-                                        page_find_start = time.time()
-                                        page_num = self._find_page_for_position(current_section['start_char'], pages) if pages else 1
-                                        page_find_time = time.time() - page_find_start
-                                        page_find_calls += 1
-                                        # #region agent log
-                                        debug_log("text_processor.py:310", "_find_page_for_position call (fuzzy)", {"time": page_find_time, "call_number": page_find_calls, "section_name": current_section['name']}, "B")
-                                        # #endregion
-                                        
                                         sections.append({
                                             'name': current_section['name'],
                                             'text': section_text,
                                             'start_char': current_section['start_char'],
                                             'end_char': char_position,
-                                            'page': page_num
+                                            'page': 1  # Temporary, will be updated in batch
                                         })
                                 
                                 # Start new section with normalized name
@@ -382,7 +379,7 @@ class TextProcessor:
             # Log progress every 1000 lines
             if line_idx > 0 and line_idx % 1000 == 0:
                 # #region agent log
-                debug_log("text_processor.py:195", "Section loop progress", {"lines_processed": line_idx, "sections_found": len(sections), "page_find_calls": page_find_calls}, "A")
+                debug_log("text_processor.py:195", "Section loop progress", {"lines_processed": line_idx, "sections_found": len(sections)}, "A")
                 # #endregion
         
         # #region agent log
@@ -391,68 +388,68 @@ class TextProcessor:
         
         # Add final section
         if current_section['content_lines']:
-            join_start = time.time()
             section_text = '\n'.join(current_section['content_lines']).strip()
-            join_time = time.time() - join_start
-            # #region agent log
-            debug_log("text_processor.py:207", "Final section join", {"time": join_time, "content_lines": len(current_section['content_lines'])}, "E")
-            # #endregion
-            
-            page_find_start = time.time()
-            page_num = self._find_page_for_position(current_section['start_char'], pages) if pages else 1
-            page_find_time = time.time() - page_find_start
-            page_find_calls += 1
-            # #region agent log
-            debug_log("text_processor.py:212", "_find_page_for_position call", {"time": page_find_time, "call_number": page_find_calls}, "B")
-            # #endregion
-            
             sections.append({
                 'name': current_section['name'],
                 'text': section_text,
                 'start_char': current_section['start_char'],
                 'end_char': char_position,
-                'page': page_num
+                'page': 1  # Temporary, will be updated in batch
             })
         
+        # Batch update page numbers for all sections (much faster than per-section lookups)
+        if pages and sections:
+            batch_start = time.time()
+            # Build cache once
+            if not hasattr(self, '_page_boundaries_cache') or self._page_boundaries_cache is None:
+                page_boundaries = []
+                current_pos = 0
+                for page in pages:
+                    page_text = page.get('text', '')
+                    page_length = len(page_text)
+                    page_boundaries.append((current_pos, current_pos + page_length, page.get('page', 1)))
+                    current_pos += page_length + 2
+                self._page_boundaries_cache = page_boundaries
+            else:
+                page_boundaries = self._page_boundaries_cache
+            
+            # Update all sections in one pass
+            for section in sections:
+                char_pos = section['start_char']
+                # Binary search
+                left, right = 0, len(page_boundaries) - 1
+                while left <= right:
+                    mid = (left + right) // 2
+                    start, end, page_num = page_boundaries[mid]
+                    if start <= char_pos < end:
+                        section['page'] = page_num
+                        break
+                    elif char_pos < start:
+                        right = mid - 1
+                    else:
+                        left = mid + 1
+                else:
+                    # Default to last page
+                    section['page'] = page_boundaries[-1][2] if page_boundaries else 1
+            
+            batch_time = time.time() - batch_start
+            # #region agent log
+            debug_log("text_processor.py:400", "Batch page number update", {"time": batch_time, "num_sections": len(sections)}, "B")
+            # #endregion
+        
         # #region agent log
-        debug_log("text_processor.py:222", "extract_sections exit", {"num_sections": len(sections), "total_page_find_calls": page_find_calls}, "A")
+        debug_log("text_processor.py:222", "extract_sections exit", {"num_sections": len(sections)}, "A")
         # #endregion
         
         return sections
     
     def _find_page_for_position(self, char_position: int, pages: List[Dict]) -> int:
         """Find which page a character position belongs to (optimized with binary search)."""
-        import time
-        import json
-        from pathlib import Path
-        
-        DEBUG_LOG_PATH = Path("/Volumes/8SSD/ArxivCS/.cursor/debug.log")
-        
-        def debug_log(location, message, data, hypothesis_id=None):
-            try:
-                log_entry = {
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": hypothesis_id,
-                    "location": location,
-                    "message": message,
-                    "data": data,
-                    "timestamp": int(time.time() * 1000)
-                }
-                with open(DEBUG_LOG_PATH, 'a') as f:
-                    f.write(json.dumps(log_entry) + '\n')
-            except:
-                pass
-        
         if not pages:
             return 1
         
         # Build page boundaries once (cached if called multiple times)
-        cache_build_start = time.time()
         if not hasattr(self, '_page_boundaries_cache') or self._page_boundaries_cache is None:
-            # #region agent log
-            debug_log("text_processor.py:220", "Building page boundaries cache", {"num_pages": len(pages)}, "B")
-            # #endregion
             page_boundaries = []
             current_pos = 0
             for page in pages:
@@ -461,17 +458,10 @@ class TextProcessor:
                 page_boundaries.append((current_pos, current_pos + page_length, page.get('page', 1)))
                 current_pos += page_length + 2  # +2 for page separator
             self._page_boundaries_cache = page_boundaries
-            cache_build_time = time.time() - cache_build_start
-            # #region agent log
-            debug_log("text_processor.py:230", "Page boundaries cache built", {"time": cache_build_time, "num_boundaries": len(page_boundaries)}, "B")
-            # #endregion
         else:
             page_boundaries = self._page_boundaries_cache
-            # #region agent log
-            debug_log("text_processor.py:234", "Using cached page boundaries", {"cache_size": len(page_boundaries)}, "B")
-            # #endregion
         
-        # Binary search for page
+        # Binary search for page (fast - O(log n))
         left, right = 0, len(page_boundaries) - 1
         while left <= right:
             mid = (left + right) // 2
@@ -513,6 +503,11 @@ class TextChunker:
                 logger.warning(f"Failed to load model {model_name}: {e}. Falling back to fixed chunking.")
                 self.method = "fixed"
                 self.model = None
+        elif method == "semantic" and not SENTENCE_TRANSFORMERS_AVAILABLE:
+            # Auto-fallback to sentence chunking when semantic is requested but not available
+            logger.warning("Semantic chunking requested but sentence-transformers not available. Falling back to sentence chunking.")
+            self.method = "sentence"
+            self.model = None
         else:
             self.model = None
     
