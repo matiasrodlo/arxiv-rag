@@ -5,16 +5,27 @@ Orchestrates the complete pipeline from PDF extraction to vector store indexing.
 
 import os
 import json
+import sqlite3
 from pathlib import Path
 from typing import List, Dict, Optional
 from tqdm import tqdm
 from loguru import logger
 import yaml
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
+import multiprocessing as mp
 
 from ..extractors.pdf_extractor import PDFExtractor, load_metadata
 from ..processors.text_processor import TextProcessor, TextChunker
 from ..embeddings.embedder import Embedder
 from ..storage.vector_store import VectorStore
+
+# Import worker function for multiprocessing
+try:
+    from .worker import _process_paper_worker
+except ImportError:
+    # Fallback: define worker function here if import fails
+    _process_paper_worker = None
 
 
 class RAGPipeline:
@@ -48,13 +59,23 @@ class RAGPipeline:
             max_chunk_size=self.config['text_processing']['max_chunk_size']
         )
         
+        # Initialize embeddings only if needed during processing
+        self.embedder = None
+        if self.config.get('embeddings', {}).get('generate_during_processing', True):
+            try:
         self.embedder = Embedder(
             model_name=self.config['embeddings']['model'],
             batch_size=self.config['embeddings']['batch_size'],
             device=self.config['embeddings']['device'],
             normalize_embeddings=self.config['embeddings']['normalize_embeddings']
         )
+            except ImportError:
+                logger.warning("Embeddings not available, will skip embedding generation during processing")
         
+        # Initialize vector store only if needed during processing
+        self.vector_store = None
+        if self.config.get('vector_db', {}).get('add_during_processing', True):
+            try:
         self.vector_store = VectorStore(
             db_type=self.config['vector_db']['type'],
             collection_name=self.config['vector_db']['collection_name'],
@@ -62,18 +83,130 @@ class RAGPipeline:
             qdrant_host=self.config['vector_db'].get('qdrant_host', 'localhost'),
             qdrant_port=self.config['vector_db'].get('qdrant_port', 6333)
         )
+            except ImportError:
+                logger.warning("Vector store not available, will skip vector store addition during processing")
         
         # Setup paths
         self.pdf_dir = Path(self.config['paths']['pdf_dir'])
         self.metadata_dir = Path(self.config['paths']['metadata_dir'])
         self.output_dir = Path(self.config['paths']['output_dir'])
-        self.extracted_text_dir = Path(self.config['paths']['extracted_text_dir'])
+        self.extracted_text_dir = Path(self.config['paths']['extracted_text_dir']).resolve()
         
         # Create output directories
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.extracted_text_dir.mkdir(parents=True, exist_ok=True)
         
+        # #region agent log
+        log_path = Path("/Volumes/8SSD/ArxivCS/.cursor/debug.log")
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "D",
+                    "location": "pipeline.py:97",
+                    "message": "Pipeline init - extracted_text_dir setup",
+                    "data": {
+                        "config_value": self.config['paths']['extracted_text_dir'],
+                        "resolved_path": str(self.extracted_text_dir),
+                        "exists": self.extracted_text_dir.exists(),
+                        "is_dir": self.extracted_text_dir.is_dir() if self.extracted_text_dir.exists() else False
+                    },
+                    "timestamp": int(__import__('time').time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        
+        # Initialize progress tracking database
+        self.progress_db_path = Path(self.config['paths'].get('progress_db', 'data/progress.db'))
+        self.progress_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_progress_db()
+        
         logger.info("RAG Pipeline initialized")
+    
+    def _init_progress_db(self):
+        """Initialize SQLite database for progress tracking."""
+        conn = sqlite3.connect(str(self.progress_db_path))
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS processed_papers (
+                paper_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                num_chunks INTEGER,
+                text_length INTEGER,
+                error TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_status ON processed_papers(status)
+        ''')
+        conn.commit()
+        conn.close()
+    
+    def _is_processed(self, paper_id: str) -> bool:
+        """Check if a paper has already been processed successfully."""
+        conn = sqlite3.connect(str(self.progress_db_path))
+        cursor = conn.cursor()
+        cursor.execute('SELECT status FROM processed_papers WHERE paper_id = ?', (paper_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return result[0] == 'success'
+        
+        # Also check if JSON file exists
+        json_path = self.extracted_text_dir / f"{paper_id}.json"
+        return json_path.exists()
+    
+    def _mark_processed(self, paper_id: str, status: str, num_chunks: int = 0, text_length: int = 0, error: str = None):
+        """Mark a paper as processed in the database."""
+        conn = sqlite3.connect(str(self.progress_db_path))
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO processed_papers 
+            (paper_id, status, num_chunks, text_length, error)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (paper_id, status, num_chunks, text_length, error))
+        conn.commit()
+        conn.close()
+    
+    def _mark_processed_batch(self, records: List[tuple]):
+        """
+        Batch mark multiple papers as processed in the database.
+        
+        Args:
+            records: List of tuples (paper_id, status, num_chunks, text_length, error)
+        """
+        if not records:
+            return
+        
+        conn = sqlite3.connect(str(self.progress_db_path))
+        cursor = conn.cursor()
+        cursor.executemany('''
+            INSERT OR REPLACE INTO processed_papers 
+            (paper_id, status, num_chunks, text_length, error)
+            VALUES (?, ?, ?, ?, ?)
+        ''', records)
+        conn.commit()
+        conn.close()
+    
+    def get_progress_stats(self) -> Dict:
+        """Get statistics about processing progress."""
+        conn = sqlite3.connect(str(self.progress_db_path))
+        cursor = conn.cursor()
+        cursor.execute('SELECT status, COUNT(*) FROM processed_papers GROUP BY status')
+        results = dict(cursor.fetchall())
+        conn.close()
+        
+        return {
+            'success': results.get('success', 0),
+            'failed': results.get('failed', 0),
+            'total_processed': sum(results.values())
+        }
     
     def process_paper(self, paper_id: str) -> Optional[Dict]:
         """
@@ -120,11 +253,21 @@ class RAGPipeline:
                 logger.warning(f"No chunks created for {paper_id}")
                 return None
             
-            # Step 5: Generate embeddings
+            # Step 5: Generate embeddings (if embedder is available)
+            chunks_with_embeddings = chunks
+            if self.embedder:
+                try:
             chunks_with_embeddings = self.embedder.embed_chunks(chunks, show_progress=False)
+                except Exception as e:
+                    logger.warning(f"Embedding generation failed: {e}, continuing without embeddings")
+                    chunks_with_embeddings = chunks
             
-            # Step 6: Add to vector store
+            # Step 6: Add to vector store (if vector store is available)
+            if self.vector_store:
+                try:
             self.vector_store.add_chunks(chunks_with_embeddings)
+                except Exception as e:
+                    logger.warning(f"Vector store addition failed: {e}, continuing")
             
             # Step 7: Extract sections for better structure (with page information)
             pages_data = extraction_result.get('pages', [])
@@ -236,7 +379,7 @@ class RAGPipeline:
                 }
             }
             
-            # Save enhanced JSON structure
+            # Save enhanced JSON structure (formatted for readability)
             extracted_text_path = self.extracted_text_dir / f"{paper_id}.json"
             with open(extracted_text_path, 'w', encoding='utf-8') as f:
                 json.dump(extracted_data, f, indent=2, ensure_ascii=False)
@@ -259,42 +402,234 @@ class RAGPipeline:
                 'error': str(e)
             }
     
-    def process_batch(self, paper_ids: List[str], batch_size: Optional[int] = None) -> Dict:
+    def process_batch(self, paper_ids: List[str], batch_size: Optional[int] = None, 
+                      skip_processed: bool = True, num_workers: Optional[int] = None) -> Dict:
         """
-        Process a batch of papers.
+        Process a batch of papers with parallel processing.
         
         Args:
             paper_ids: List of paper IDs to process
             batch_size: Optional batch size (from config if not provided)
+            skip_processed: Skip papers that are already processed
+            num_workers: Number of parallel workers (from config if not provided)
             
         Returns:
             Dictionary with processing statistics
         """
         batch_size = batch_size or self.config['processing']['batch_size']
+        num_workers = num_workers or self.config['processing']['num_workers']
+        
+        # Filter out already processed papers
+        skipped = 0
+        if skip_processed:
+            original_count = len(paper_ids)
+            logger.info(f"Checking {original_count} papers for already processed status...")
+            # #region agent log
+            log_path = Path("/Volumes/8SSD/ArxivCS/.cursor/debug.log")
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "I",
+                        "location": "pipeline.py:424",
+                        "message": "Starting skip_processed check",
+                        "data": {
+                            "total_papers": original_count,
+                            "skip_processed": skip_processed
+                        },
+                        "timestamp": int(__import__('time').time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+            # #endregion
+            
+            # Batch check for processed papers (more efficient)
+            import sqlite3
+            conn = sqlite3.connect(str(self.progress_db_path))
+            cursor = conn.cursor()
+            placeholders = ','.join(['?'] * len(paper_ids))
+            cursor.execute(f'SELECT paper_id FROM processed_papers WHERE paper_id IN ({placeholders}) AND status="success"', paper_ids)
+            processed_set = set(row[0] for row in cursor.fetchall())
+            conn.close()
+            
+            # Also check for existing JSON files
+            existing_files = {f.stem for f in self.extracted_text_dir.glob("*.json") if not f.name.startswith('._')}
+            processed_set.update(existing_files)
+            
+            paper_ids = [pid for pid in paper_ids if pid not in processed_set]
+            skipped = original_count - len(paper_ids)
+            
+            # #region agent log
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "I",
+                        "location": "pipeline.py:450",
+                        "message": "Skip check completed",
+                        "data": {
+                            "skipped": skipped,
+                            "remaining": len(paper_ids)
+                        },
+                        "timestamp": int(__import__('time').time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+            # #endregion
+            
+            if skipped > 0:
+                logger.info(f"Skipping {skipped} already processed papers")
+        
+        if not paper_ids:
+            logger.info("All papers already processed")
+            return {
+                'total': original_count if skip_processed else 0,
+                'successful': skipped,
+                'failed': 0,
+                'skipped': skipped,
+                'errors': []
+            }
         
         results = {
             'total': len(paper_ids),
             'successful': 0,
             'failed': 0,
+            'skipped': skipped,
             'errors': []
         }
         
-        # Process in batches
-        for i in tqdm(range(0, len(paper_ids), batch_size), desc="Processing batches"):
-            batch = paper_ids[i:i + batch_size]
-            
-            for paper_id in tqdm(batch, desc=f"Batch {i//batch_size + 1}", leave=False):
-                result = self.process_paper(paper_id)
+        # Process in batches with parallel workers
+        total_batches = (len(paper_ids) + batch_size - 1) // batch_size
+        
+        with tqdm(total=len(paper_ids), desc="Processing papers") as pbar:
+            for batch_idx in range(0, len(paper_ids), batch_size):
+                batch = paper_ids[batch_idx:batch_idx + batch_size]
                 
+                # Process batch in parallel
+                if _process_paper_worker is None:
+                    # Fallback to sequential processing if worker not available
+                    logger.warning("Worker function not available, using sequential processing")
+                    batch_db_records = []
+                    batch_size_db = 50  # Write to DB every 50 papers
+                    
+                    for paper_id in batch:
+                result = self.process_paper(paper_id)
                 if result and result.get('success'):
                     results['successful'] += 1
+                            batch_db_records.append((
+                                paper_id, 'success',
+                                result.get('num_chunks', 0),
+                                result.get('text_length', 0),
+                                None
+                            ))
+                        else:
+                            results['failed'] += 1
+                            error_msg = result.get('error', 'Unknown error') if result else 'Processing failed'
+                            batch_db_records.append((
+                                paper_id, 'failed', 0, 0, error_msg
+                            ))
+                            results['errors'].append({
+                                'paper_id': paper_id,
+                                'error': error_msg
+                            })
+                        pbar.update(1)
+                        
+                        # Batch write to database
+                        if len(batch_db_records) >= batch_size_db:
+                            self._mark_processed_batch(batch_db_records)
+                            batch_db_records = []
+                    
+                    # Write remaining records
+                    if batch_db_records:
+                        self._mark_processed_batch(batch_db_records)
                 else:
+                    # Batch database writes for better performance
+                    batch_db_records = []
+                    batch_size_db = 50  # Write to DB every 50 papers
+                    
+                    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                        # Submit all papers in batch
+                        # #region agent log
+                        log_path = Path("/Volumes/8SSD/ArxivCS/.cursor/debug.log")
+                        try:
+                            with open(log_path, 'a', encoding='utf-8') as log_file:
+                                import json as json_lib
+                                log_entry = {
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "H",
+                                    "location": "pipeline.py:477",
+                                    "message": "Submitting worker tasks",
+                                    "data": {
+                                        "batch_size": len(batch),
+                                        "extracted_text_dir": str(self.extracted_text_dir),
+                                        "extracted_text_dir_resolved": str(self.extracted_text_dir.resolve()),
+                                        "cwd": os.getcwd()
+                                    },
+                                    "timestamp": int(__import__('time').time() * 1000)
+                                }
+                                log_file.write(json_lib.dumps(log_entry) + "\n")
+                        except Exception:
+                            pass
+                        # #endregion
+                        
+                        future_to_paper = {
+                            executor.submit(_process_paper_worker, str(self.pdf_dir.resolve()), 
+                                           str(self.metadata_dir.resolve()), str(self.extracted_text_dir.resolve()),
+                                           str(self.progress_db_path.resolve()), paper_id, self.config): paper_id
+                            for paper_id in batch
+                        }
+                    
+                        # Collect results as they complete
+                        for future in as_completed(future_to_paper):
+                            paper_id = future_to_paper[future]
+                            try:
+                                result = future.result()
+                                if result and result.get('success'):
+                                    results['successful'] += 1
+                                    batch_db_records.append((
+                                        paper_id, 'success',
+                                        result.get('num_chunks', 0),
+                                        result.get('text_length', 0),
+                                        None
+                                    ))
+                                else:
+                                    results['failed'] += 1
+                                    error_msg = result.get('error', 'Unknown error') if result else 'Processing failed'
+                                    batch_db_records.append((
+                                        paper_id, 'failed', 0, 0, error_msg
+                                    ))
+                                    results['errors'].append({
+                                        'paper_id': paper_id,
+                                        'error': error_msg
+                                    })
+                            except Exception as e:
                     results['failed'] += 1
-                    if result:
+                                error_msg = str(e)
+                                batch_db_records.append((
+                                    paper_id, 'failed', 0, 0, error_msg
+                                ))
                         results['errors'].append({
                             'paper_id': paper_id,
-                            'error': result.get('error', 'Unknown error')
-                        })
+                                    'error': error_msg
+                                })
+                            finally:
+                                pbar.update(1)
+                                
+                                # Batch write to database
+                                if len(batch_db_records) >= batch_size_db:
+                                    self._mark_processed_batch(batch_db_records)
+                                    batch_db_records = []
+                    
+                    # Write remaining records
+                    if batch_db_records:
+                        self._mark_processed_batch(batch_db_records)
         
         logger.info(f"Batch processing complete: {results['successful']} successful, {results['failed']} failed")
         return results
@@ -323,14 +658,18 @@ class RAGPipeline:
     
     def get_stats(self) -> Dict:
         """Get statistics about the processed data."""
-        vector_stats = self.vector_store.get_stats()
+        vector_stats = self.vector_store.get_stats() if hasattr(self, 'vector_store') else {}
         
         # Count processed papers
         processed_files = list(self.extracted_text_dir.glob("*.json"))
         
+        # Get progress stats
+        progress_stats = self.get_progress_stats()
+        
         return {
             'vector_store': vector_stats,
             'processed_papers': len(processed_files),
-            'extracted_text_dir': str(self.extracted_text_dir)
+            'extracted_text_dir': str(self.extracted_text_dir),
+            'progress': progress_stats
         }
 

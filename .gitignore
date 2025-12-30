@@ -69,6 +69,7 @@ test_results/
 batch_test_*
 extraction_quality_report.json
 test_metadata_sample.json
+testing/
 
 # Jupyter Notebook
 .ipynb_checkpoints
