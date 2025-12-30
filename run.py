@@ -13,7 +13,7 @@ import yaml
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.pipeline import RAGPipeline
+from src.core.pipeline import RAGPipeline
 
 
 def setup_logging(config_path: str = "config.yaml"):
@@ -129,8 +129,13 @@ def main():
             
             logger.info(f"Processing {len(paper_ids)} papers")
             
-            # Process batch
-            results = pipeline.process_batch(paper_ids, batch_size=args.batch_size)
+            # Process batch with parallel processing
+            results = pipeline.process_batch(
+                paper_ids, 
+                batch_size=args.batch_size,
+                skip_processed=True,  # Skip already processed papers
+                num_workers=None  # Use config default
+            )
             
             # Print statistics
             logger.info("=" * 60)
