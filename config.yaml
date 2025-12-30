@@ -7,6 +7,7 @@ paths:
   output_dir: "output"
   vector_db_path: "data/vector_db"
   extracted_text_dir: "output"
+  progress_db: "data/progress.db"  # SQLite database for progress tracking
 
 # PDF Extraction
 pdf_extraction:
@@ -41,12 +42,14 @@ embeddings:
   batch_size: 128  # Optimized for M4 Max with 128GB RAM (was 32)
   device: "mps"  # Use Metal Performance Shaders (Apple GPU) for maximum speed
   normalize_embeddings: true
+  generate_during_processing: false  # Set to false for large-scale: generate embeddings in separate batch step
 
 # Vector Database
 vector_db:
   type: "chroma"  # chroma, qdrant
   collection_name: "arxiv_cs_papers"
   persist_directory: "data/vector_db"
+  add_during_processing: false  # Set to false for large-scale: add to vector store in separate batch step
   # For Qdrant:
   # qdrant_host: "localhost"
   # qdrant_port: 6333
@@ -62,10 +65,12 @@ retrieval:
 
 # Processing
 processing:
-  batch_size: 500  # Papers per batch (optimized for 128GB RAM, was 100)
-  num_workers: 12  # Parallel workers (12 performance cores, was 4)
+  batch_size: 1000  # Papers per batch (optimized for 800K papers, was 500)
+  num_workers: 14  # Parallel workers (optimized for stability: avg 53.3%, max 99.8% with 16 workers, reduced to 14 for headroom)
   max_retries: 3
   retry_delay: 1  # seconds
+  skip_processed: true  # Skip papers that are already processed
+  checkpoint_interval: 100  # Save progress every N papers
 
 # Logging
 logging:
