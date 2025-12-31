@@ -331,6 +331,21 @@ class RAGPipeline:
                 chunk_start_positions.append(current_pos)
                 current_pos += len(chunk['text']) + 1  # +1 for separator
             
+            # Extract citations and enhanced metadata
+            try:
+                citations_data = TextProcessor.extract_citations(cleaned_text, sections=sections)
+            except Exception as e:
+                logger.warning(f"Citation extraction failed for {paper_id}: {e}")
+                citations_data = {'in_text': [], 'references': [], 'total_citations': 0, 'total_references': 0}
+            
+            try:
+                enhanced_metadata = TextProcessor.extract_metadata(cleaned_text, sections=sections)
+                # Merge enhanced metadata into existing metadata
+                metadata.update(enhanced_metadata)
+            except Exception as e:
+                logger.warning(f"Metadata extraction failed for {paper_id}: {e}")
+                enhanced_metadata = {}
+            
             extracted_data = {
                 'paper_id': paper_id,
                 'metadata': {
@@ -363,6 +378,7 @@ class RAGPipeline:
                         for s in sections
                     ]
                 },
+                'citations': citations_data,
                 'chunks': [
                     {
                         'chunk_id': f"{paper_id}_chunk_{i}",
@@ -384,7 +400,9 @@ class RAGPipeline:
                     'num_sections': len(sections),
                     'total_chars': len(cleaned_text),
                     'avg_chunk_size': sum(len(c['text']) for c in chunks) / len(chunks) if chunks else 0,
-                    'chunking_method': self.chunker.method
+                    'chunking_method': self.chunker.method,
+                    'total_citations': citations_data.get('total_citations', 0),
+                    'total_references': citations_data.get('total_references', 0)
                 }
             }
             

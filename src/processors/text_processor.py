@@ -717,4 +717,284 @@ class TextChunker:
         """Calculate cosine similarity between two vectors."""
         import numpy as np
         return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    
+    @staticmethod
+    def extract_citations(text: str, sections: Optional[List[Dict]] = None) -> Dict:
+        """
+        Extract citations from text and parse reference section.
+        Enhanced version with better context and page tracking.
+        
+        Args:
+            text: Full text of the paper
+            sections: List of section dictionaries with 'name' and 'text'
+            
+        Returns:
+            Dictionary with 'in_text' and 'references' lists
+        """
+        if not text:
+            return {'in_text': [], 'references': [], 'total_citations': 0, 'total_references': 0}
+        
+        citations_in_text = []
+        references = []
+        
+        # Enhanced pattern to match citations: [1], [2, 3], [1-5], [1,2,3], etc.
+        # Also handles (1), (2,3) style citations
+        citation_patterns = [
+            r'\[(\d+(?:[,\s-]\d+)*)\]',  # [1], [2, 3], [1-5]
+            r'\((\d+(?:[,\s-]\d+)*)\)'   # (1), (2, 3) - less common but possible
+        ]
+        
+        # Find all citations in text
+        for pattern in citation_patterns:
+            for match in re.finditer(pattern, text):
+                citation_id = match.group(0)  # e.g., "[1]" or "[2, 3]"
+                position = match.start()
+                
+                # Skip if this looks like part of a reference entry (e.g., "[1] Author...")
+                # Check if it's in a references section
+                is_in_references = False
+                if sections:
+                    for section in sections:
+                        section_name = section.get('name', '').lower()
+                        if any(term in section_name for term in ['reference', 'bibliography']):
+                            start_char = section.get('start_char', 0)
+                            end_char = section.get('end_char', len(text))
+                            if start_char <= position < end_char:
+                                is_in_references = True
+                                break
+                
+                # Skip citations in references section (those are reference markers, not citations)
+                if is_in_references:
+                    continue
+                
+                # Get context around citation (100 chars before and after for better context)
+                start_ctx = max(0, position - 100)
+                end_ctx = min(len(text), position + len(citation_id) + 100)
+                context = text[start_ctx:end_ctx]
+                
+                # Determine section
+                section_name = 'Unknown'
+                page_num = 1
+                if sections:
+                    for section in sections:
+                        start_char = section.get('start_char', 0)
+                        end_char = section.get('end_char', len(text))
+                        if start_char <= position < end_char:
+                            section_name = section.get('name', 'Unknown')
+                            page_num = section.get('page', 1)
+                            break
+                
+                # Extract individual citation numbers
+                citation_numbers = []
+                for num_str in re.findall(r'\d+', citation_id):
+                    try:
+                        num = int(num_str)
+                        if 1 <= num <= 1000:  # Reasonable range for citations
+                            citation_numbers.append(num)
+                    except ValueError:
+                        pass
+                
+                if citation_numbers:  # Only add if we found valid citation numbers
+                    citations_in_text.append({
+                        'citation_id': citation_id,
+                        'position': position,
+                        'context': context.strip(),
+                        'section': section_name,
+                        'page': page_num,
+                        'citation_numbers': citation_numbers
+                    })
+        
+        # Extract references section
+        references_text = None
+        if sections:
+            for section in sections:
+                section_name = section.get('name', '').lower()
+                if any(term in section_name for term in ['reference', 'bibliography', 'works cited']):
+                    references_text = section.get('text', '')
+                    break
+        
+        # If no references section found, try to find it in text
+        if not references_text:
+            # Look for "References" or "Bibliography" heading
+            ref_pattern = r'(?:References|Bibliography|Works Cited)[\s\n]+(.*?)(?=\n\s*\n|$)'
+            match = re.search(ref_pattern, text, re.IGNORECASE | re.DOTALL)
+            if match:
+                references_text = match.group(1)
+        
+        # Parse individual references if references section found
+        if references_text:
+            # Pattern to match reference entries: [1] Author, Title...
+            ref_entry_pattern = r'\[(\d+)\]\s*(.+?)(?=\n\s*\[\d+\]|$)'
+            for match in re.finditer(ref_entry_pattern, references_text, re.DOTALL):
+                ref_id = match.group(1)
+                ref_text = match.group(2).strip()
+                
+                # Try to extract title (usually in quotes or first line)
+                title = None
+                title_match = re.search(r'"([^"]+)"', ref_text)
+                if not title_match:
+                    title_match = re.search(r'([A-Z][^.]{10,100})', ref_text)
+                if title_match:
+                    title = title_match.group(1).strip()
+                
+                # Try to extract authors (usually before title, comma-separated)
+                authors = []
+                if title:
+                    before_title = ref_text[:ref_text.find(title)]
+                    # Look for author patterns
+                    author_matches = re.findall(r'([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)', before_title)
+                    authors = author_matches[:5]  # Limit to first 5 authors
+                
+                # Try to extract year
+                year = None
+                year_match = re.search(r'\b(19|20)\d{2}\b', ref_text)
+                if year_match:
+                    year = int(year_match.group(0))
+                
+                # Try to extract arXiv ID if present
+                arxiv_id = None
+                arxiv_match = re.search(r'arXiv:\s*(\d{4}\.\d{4,5}v?\d*)', ref_text, re.IGNORECASE)
+                if arxiv_match:
+                    arxiv_id = arxiv_match.group(1)
+                
+                references.append({
+                    'ref_id': f"[{ref_id}]",
+                    'text': ref_text[:500],  # Limit length
+                    'title': title,
+                    'authors': authors,
+                    'year': year,
+                    'arxiv_id': arxiv_id
+                })
+        
+        return {
+            'in_text': citations_in_text,
+            'references': references,
+            'total_citations': len(citations_in_text),
+            'total_references': len(references)
+        }
+    
+    @staticmethod
+    def extract_metadata(text: str, sections: Optional[List[Dict]] = None) -> Dict:
+        """
+        Extract title, authors, and abstract from text.
+        
+        Args:
+            text: Full text of the paper
+            sections: List of section dictionaries
+            
+        Returns:
+            Dictionary with title, authors, abstract
+        """
+        metadata = {}
+        
+        # Extract title (usually first substantial line, before Abstract)
+        lines = text.split('\n')
+        title_candidates = []
+        
+        # First, try to find title in sections (some papers have title as a section)
+        if sections:
+            for section in sections:
+                section_name = section.get('name', '').strip()
+                section_text = section.get('text', '').strip()
+                # Check if section name looks like a title
+                if (len(section_name) > 10 and len(section_name) < 200 and 
+                    section_name[0].isupper() and 
+                    not any(word in section_name.lower() for word in ['abstract', 'introduction', 'method', 'result'])):
+                    title_candidates.append((0, section_name))
+                    break
+        
+        # If no title in sections, look in first lines
+        if not title_candidates:
+            for i, line in enumerate(lines[:30]):  # Check first 30 lines
+                line = line.strip()
+                if len(line) > 15 and len(line) < 250:  # Reasonable title length
+                    # Skip common non-title patterns
+                    if not re.match(r'^(arXiv:|Abstract|Introduction|1\.|I\.|Keywords|Index Terms)', line, re.IGNORECASE):
+                        # Check if it looks like a title (capitalized, no ending punctuation, not all caps)
+                        if (line[0].isupper() and 
+                            not line.endswith('.') and 
+                            not line.isupper() and  # Not all caps
+                            line.count(':') <= 1):  # May have subtitle
+                            title_candidates.append((i, line))
+        
+        if title_candidates:
+            # Prefer first candidate (earliest in document)
+            title = title_candidates[0][1]
+            # Clean title (remove extra whitespace, fix common issues)
+            title = re.sub(r'\s+', ' ', title).strip()
+            metadata['title'] = title
+        
+        # Extract abstract
+        abstract = None
+        if sections:
+            for section in sections:
+                section_name = section.get('name', '').lower()
+                if 'abstract' in section_name:
+                    abstract = section.get('text', '').strip()
+                    # Clean abstract (remove common prefixes)
+                    abstract = re.sub(r'^abstract\s*:?\s*', '', abstract, flags=re.IGNORECASE)
+                    # Remove arXiv ID if present at start
+                    abstract = re.sub(r'^arXiv:\s*\d+\.\d+v?\d*\s*\[.*?\]\s*\d+\s+\w+\s+\d+\s*', '', abstract, flags=re.IGNORECASE)
+                    break
+        
+        # If no abstract section found, try to find it in text
+        if not abstract:
+            # Try multiple patterns
+            abstract_patterns = [
+                r'Abstract\s*:?\s*(.+?)(?=\n\s*(?:1\.|Introduction|Keywords|Index Terms|I\.))',
+                r'ABSTRACT\s*:?\s*(.+?)(?=\n\s*(?:1\.|Introduction|Keywords|Index Terms))',
+                r'Abstract\s*:?\s*(.+?)(?=\n\n)',
+            ]
+            for pattern in abstract_patterns:
+                match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+                if match:
+                    abstract = match.group(1).strip()
+                    # Clean abstract
+                    abstract = re.sub(r'^abstract\s*:?\s*', '', abstract, flags=re.IGNORECASE)
+                    abstract = re.sub(r'^arXiv:\s*\d+\.\d+v?\d*\s*\[.*?\]\s*\d+\s+\w+\s+\d+\s*', '', abstract, flags=re.IGNORECASE)
+                    break
+        
+        if abstract:
+            # Limit abstract length and clean
+            abstract = re.sub(r'\s+', ' ', abstract).strip()
+            if len(abstract) > 2000:
+                abstract = abstract[:2000] + '...'
+            metadata['abstract'] = abstract
+        
+        # Extract authors (usually after title, before abstract)
+        authors = []
+        if metadata.get('title'):
+            title_pos = text.find(metadata['title'])
+            # Look for authors in next 20 lines after title
+            after_title = text[title_pos + len(metadata['title']):title_pos + len(metadata['title']) + 2000]
+            
+            # Pattern: Author names (usually "First Last" or "First Middle Last")
+            # Look for lines with multiple capitalized words
+            author_lines = after_title.split('\n')[:15]
+            for line in author_lines:
+                line = line.strip()
+                # Skip empty lines and common non-author patterns
+                if not line or re.match(r'^(arXiv:|Abstract|1\.|Introduction|University|School|Department|Email)', line, re.IGNORECASE):
+                    continue
+                
+                # Look for author patterns: "First Last" or "First M. Last"
+                author_matches = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+)', line)
+                if author_matches:
+                    authors.extend(author_matches)
+                    if len(authors) >= 10:  # Limit to 10 authors
+                        break
+        
+        # Clean authors (remove duplicates, limit length)
+        if authors:
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_authors = []
+            for author in authors:
+                author_clean = author.strip()
+                if author_clean and author_clean not in seen:
+                    seen.add(author_clean)
+                    unique_authors.append(author_clean)
+            metadata['authors'] = unique_authors[:10]  # Limit to 10 authors
+        
+        return metadata
 
