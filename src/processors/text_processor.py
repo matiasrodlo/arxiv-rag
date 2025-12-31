@@ -4,15 +4,63 @@ Handles text cleaning, normalization, and intelligent chunking.
 """
 
 import re
+import time
+from pathlib import Path
 from typing import List, Dict, Optional
 from loguru import logger
 
 try:
     from sentence_transformers import SentenceTransformer
+    import torch
     SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
+    # #region agent log
+    log_path = Path("/Volumes/8SSD/ArxivCS/.cursor/debug.log")
+    try:
+        with open(log_path, 'a', encoding='utf-8') as log_file:
+            import json as json_lib
+            import time
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "A",
+                "location": "text_processor.py:11",
+                "message": "sentence-transformers import check",
+                "data": {
+                    "available": True,
+                    "torch_available": torch is not None,
+                    "mps_available": torch.backends.mps.is_available() if torch else False
+                },
+                "timestamp": int(time.time() * 1000)
+            }
+            log_file.write(json_lib.dumps(log_entry) + "\n")
+    except Exception:
+        pass
+    # #endregion
+except ImportError as e:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
     logger.warning("sentence-transformers not available")
+    # #region agent log
+    log_path = Path("/Volumes/8SSD/ArxivCS/.cursor/debug.log")
+    try:
+        with open(log_path, 'a', encoding='utf-8') as log_file:
+            import json as json_lib
+            import time
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "A",
+                "location": "text_processor.py:14",
+                "message": "sentence-transformers import failed",
+                "data": {
+                    "available": False,
+                    "error": str(e)
+                },
+                "timestamp": int(time.time() * 1000)
+            }
+            log_file.write(json_lib.dumps(log_entry) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
 from ..extractors.formula_processor import FormulaProcessor, improve_formula_formatting
 
@@ -433,7 +481,7 @@ class TextProcessor:
                     section['page'] = page_boundaries[-1][2] if page_boundaries else 1
             
             batch_time = time.time() - batch_start
-            # #region agent log
+        # #region agent log
             debug_log("text_processor.py:400", "Batch page number update", {"time": batch_time, "num_sections": len(sections)}, "B")
             # #endregion
         
@@ -486,25 +534,172 @@ class TextChunker:
                  chunk_overlap: int = 50,
                  model_name: Optional[str] = None,
                  min_chunk_size: int = 100,
-                 max_chunk_size: int = 1000):
+                 max_chunk_size: int = 1000,
+                 device: str = "cpu",
+                 batch_size: int = 512,
+                 enable_mixed_precision: bool = True):
         self.method = method
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
+        self.device = device
+        self.batch_size = batch_size
+        self.enable_mixed_precision = enable_mixed_precision
         
         # Load model for semantic chunking
+        # #region agent log
+        log_path = Path("/Volumes/8SSD/ArxivCS/arxiv-rag/.cursor/debug.log")
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                import time
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "B",
+                    "location": "text_processor.py:502",
+                    "message": "TextChunker init - before model load",
+                    "data": {
+                        "method": method,
+                        "device": device,
+                        "batch_size": batch_size,
+                        "enable_mixed_precision": enable_mixed_precision,
+                        "sentence_transformers_available": SENTENCE_TRANSFORMERS_AVAILABLE
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        
         if method == "semantic" and SENTENCE_TRANSFORMERS_AVAILABLE:
             model_name = model_name or "sentence-transformers/all-MiniLM-L6-v2"
             try:
-                self.model = SentenceTransformer(model_name)
-                logger.info(f"Loaded model for semantic chunking: {model_name}")
+                # Fix for multiprocessing: MPS device cannot be shared across processes
+                # Detect if we're in a multiprocessing context and fall back to CPU
+                import multiprocessing as mp
+                import torch
+                import os
+                actual_device = device
+                if device == "mps":
+                    try:
+                        # Check if we're in a worker process (multiprocessing context)
+                        # Multiple detection methods for reliability
+                        current_process = mp.current_process()
+                        process_name = current_process.name
+                        is_worker_process = (
+                            process_name != "MainProcess" or
+                            "SpawnProcess" in process_name or
+                            "ForkProcess" in process_name
+                        )
+                        
+                        # Also check if we can safely use MPS (it often fails in workers)
+                        mps_available = torch.backends.mps.is_available() if torch else False
+                        
+                        if is_worker_process or not mps_available:
+                            # MPS has issues in multiprocessing - use CPU instead
+                            if is_worker_process:
+                                logger.warning(f"MPS device requested but in multiprocessing context (process: {process_name}). Falling back to CPU.")
+                            else:
+                                logger.warning("MPS requested but not available. Falling back to CPU.")
+                            actual_device = "cpu"
+                    except Exception as e:
+                        logger.warning(f"Error checking MPS availability: {e}. Falling back to CPU.")
+                        actual_device = "cpu"
+                
+                self.model = SentenceTransformer(model_name, device=actual_device)
+                # Update device attribute to reflect actual device used
+                self.device = actual_device
+                
+                # #region agent log
+                try:
+                    with open(log_path, 'a', encoding='utf-8') as log_file:
+                        import json as json_lib
+                        import time
+                        import torch
+                        detected_device = "unknown"
+                        if hasattr(self.model, '_modules') and len(self.model._modules) > 0:
+                            first_module = list(self.model._modules.values())[0]
+                            if hasattr(first_module, 'device'):
+                                detected_device = str(first_module.device)
+                        current_process = mp.current_process()
+                        is_worker = current_process.name != "MainProcess"
+                        log_entry = {
+                            "sessionId": "perf-test",
+                            "runId": "run1",
+                            "hypothesisId": "MODEL_LOADED",
+                            "location": "text_processor.py:611",
+                            "message": "Model loaded successfully",
+                            "data": {
+                                "model_name": model_name,
+                                "requested_device": device,
+                                "actual_device": actual_device,
+                                "detected_device": detected_device,
+                                "mps_available": torch.backends.mps.is_available() if torch else False,
+                                "batch_size": batch_size,
+                                "enable_mixed_precision": enable_mixed_precision,
+                                "is_worker_process": is_worker,
+                                "process_name": current_process.name
+                            },
+                            "timestamp": int(time.time() * 1000)
+                        }
+                        log_file.write(json_lib.dumps(log_entry) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+                logger.info(f"Loaded model for semantic chunking: {model_name} on {actual_device} (requested: {device})")
             except Exception as e:
+                # #region agent log
+                try:
+                    with open(log_path, 'a', encoding='utf-8') as log_file:
+                        import json as json_lib
+                        import time
+                        log_entry = {
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "B",
+                            "location": "text_processor.py:509",
+                            "message": "Model load failed",
+                            "data": {
+                                "model_name": model_name,
+                                "device": device,
+                                "error": str(e),
+                                "error_type": type(e).__name__
+                            },
+                            "timestamp": int(time.time() * 1000)
+                        }
+                        log_file.write(json_lib.dumps(log_entry) + "\n")
+                except Exception:
+                    pass
+                # #endregion
                 logger.warning(f"Failed to load model {model_name}: {e}. Falling back to fixed chunking.")
                 self.method = "fixed"
                 self.model = None
         elif method == "semantic" and not SENTENCE_TRANSFORMERS_AVAILABLE:
             # Auto-fallback to sentence chunking when semantic is requested but not available
+            # #region agent log
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    import time
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "A",
+                        "location": "text_processor.py:514",
+                        "message": "sentence-transformers not available in worker",
+                        "data": {
+                            "method": method,
+                            "falling_back_to": "sentence"
+                        },
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+            # #endregion
             logger.warning("Semantic chunking requested but sentence-transformers not available. Falling back to sentence chunking.")
             self.method = "sentence"
             self.model = None
@@ -525,7 +720,44 @@ class TextChunker:
         if not text or len(text.strip()) < self.min_chunk_size:
             return []
         
+        # For CPU device in multiprocessing, semantic chunking can hang
+        # Fall back to fixed chunking for reliability
+        import multiprocessing as mp
+        current_process = mp.current_process()
+        is_worker_process = (
+            current_process.name != "MainProcess" or
+            "SpawnProcess" in current_process.name or
+            "ForkProcess" in current_process.name
+        )
+        
         if self.method == "semantic" and self.model:
+            # Use semantic chunking only if not in worker process or if device is GPU
+            if is_worker_process and self.device == "cpu":
+                # #region agent log
+                try:
+                    log_path = Path("/Volumes/8SSD/ArxivCS/arxiv-rag/.cursor/debug.log")
+                    with open(log_path, 'a', encoding='utf-8') as log_file:
+                        import json as json_lib
+                        import time
+                        log_entry = {
+                            "sessionId": "perf-test",
+                            "runId": "run1",
+                            "hypothesisId": "SKIP_SEMANTIC",
+                            "location": "text_processor.py:722",
+                            "message": "Skipping semantic chunking for worker process, using fixed chunking",
+                            "data": {
+                                "process_name": current_process.name,
+                                "device": self.device,
+                                "text_length": len(text)
+                            },
+                            "timestamp": int(time.time() * 1000)
+                        }
+                        log_file.write(json_lib.dumps(log_entry) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+                logger.debug(f"Worker process with CPU device: using fixed chunking instead of semantic for reliability")
+                return self._chunk_fixed(text, metadata)
             return self._chunk_semantic(text, metadata)
         elif self.method == "sentence":
             return self._chunk_by_sentence(text, metadata)
@@ -534,11 +766,38 @@ class TextChunker:
     
     def _chunk_fixed(self, text: str, metadata: Optional[Dict] = None) -> List[Dict[str, any]]:
         """Fixed-size chunking with overlap."""
+        # #region agent log
+        fixed_chunk_start = time.time()
+        log_path = Path("/Volumes/8SSD/ArxivCS/arxiv-rag/.cursor/debug.log")
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                log_entry = {
+                    "sessionId": "perf-test",
+                    "runId": "run1",
+                    "hypothesisId": "FIXED_CHUNK_START",
+                    "location": "text_processor.py:730",
+                    "message": "Starting fixed chunking",
+                    "data": {
+                        "text_length": len(text),
+                        "chunk_size": self.chunk_size,
+                        "chunk_overlap": self.chunk_overlap
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        
         chunks = []
         text_length = len(text)
         start = 0
+        iteration = 0
+        max_iterations = (text_length // (self.chunk_size - self.chunk_overlap)) + 10  # Safety limit
         
-        while start < text_length:
+        while start < text_length and iteration < max_iterations:
+            iteration += 1
             end = min(start + self.chunk_size, text_length)
             chunk_text = text[start:end]
             
@@ -569,9 +828,37 @@ class TextChunker:
                 })
             
             # Move start position with overlap
-            start = end - self.chunk_overlap
-            if start >= text_length:
+            new_start = end - self.chunk_overlap
+            # Check if we've reached the end or if we're not making progress
+            if end >= text_length:
                 break
+            if new_start <= start:
+                # Safety check: if we're not making progress, break
+                break
+            start = new_start
+        
+        # #region agent log
+        fixed_chunk_duration = time.time() - fixed_chunk_start
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                log_entry = {
+                    "sessionId": "perf-test",
+                    "runId": "run1",
+                    "hypothesisId": "FIXED_CHUNK_END",
+                    "location": "text_processor.py:770",
+                    "message": "Fixed chunking completed",
+                    "data": {
+                        "duration_seconds": fixed_chunk_duration,
+                        "num_chunks": len(chunks),
+                        "text_length": text_length
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
         
         return chunks
     
@@ -648,8 +935,261 @@ class TextChunker:
         
         # Get embeddings for all sentences
         try:
-            embeddings = self.model.encode(sentences, show_progress_bar=False)
+            # Use mixed precision if on GPU and available
+            use_mixed_precision = False
+            if self.device in ["mps", "cuda"]:
+                try:
+                    import torch
+                    if torch and hasattr(torch, 'autocast'):
+                        use_mixed_precision = self.enable_mixed_precision
+                except:
+                    pass
+            
+            batch_size = getattr(self, 'batch_size', 512)
+            # #region agent log
+            log_path = Path("/Volumes/8SSD/ArxivCS/.cursor/debug.log")
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    import time
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "C",
+                        "location": "text_processor.py:652",
+                        "message": "Before chunking encode",
+                        "data": {
+                            "device": self.device,
+                            "batch_size": batch_size,
+                            "enable_mixed_precision": self.enable_mixed_precision,
+                            "use_mixed_precision": use_mixed_precision,
+                            "num_sentences": len(sentences)
+                        },
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+            # #endregion
+            
+            # Ensure sentences is a list of strings (not empty, properly formatted)
+            if not sentences or not isinstance(sentences, list):
+                logger.warning("Invalid sentences format, falling back to fixed chunking")
+                return self._chunk_fixed(text, metadata)
+            
+            # Convert to list and ensure all are non-empty strings
+            sentence_list = []
+            for s in sentences:
+                if s and isinstance(s, str):
+                    stripped = s.strip()
+                    if stripped:
+                        sentence_list.append(stripped)
+                elif s:
+                    # Try to convert to string
+                    try:
+                        stripped = str(s).strip()
+                        if stripped:
+                            sentence_list.append(stripped)
+                    except:
+                        continue
+            
+            if not sentence_list or len(sentence_list) < 2:
+                logger.warning(f"Not enough valid sentences ({len(sentence_list)}), falling back to fixed chunking")
+                return self._chunk_fixed(text, metadata)
+            
+            # Ensure we have a proper list of strings for sentence-transformers
+            # sentence-transformers expects a list of strings or a single string
+            # #region agent log
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    import time
+                    log_entry = {
+                        "sessionId": "perf-test",
+                        "runId": "run1",
+                        "hypothesisId": "BEFORE_ENCODE",
+                        "location": "text_processor.py:920",
+                        "message": "About to call model.encode",
+                        "data": {
+                            "sentence_list_type": type(sentence_list).__name__,
+                            "sentence_list_length": len(sentence_list),
+                            "first_sentence_type": type(sentence_list[0]).__name__ if sentence_list else "none",
+                            "first_sentence_preview": sentence_list[0][:50] if sentence_list else "none",
+                            "device": self.device,
+                            "use_mixed_precision": use_mixed_precision
+                        },
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+            # #endregion
+            
+            try:
+                # #region agent log
+                encode_start = time.time()
+                # #endregion
+                
+                if use_mixed_precision and self.device in ["mps", "cuda"]:
+                    import torch
+                    with torch.inference_mode():
+                        with torch.autocast(device_type="mps" if self.device == "mps" else "cuda"):
+                            embeddings = self.model.encode(
+                                sentence_list, 
+                                show_progress_bar=False,
+                                batch_size=batch_size,
+                                convert_to_numpy=True
+                            )
+                else:
+                    # For CPU, use simpler call without extra parameters that might cause issues
+                    embeddings = self.model.encode(
+                        sentence_list, 
+                        show_progress_bar=False,
+                        batch_size=min(batch_size, 32),  # Smaller batch for CPU
+                        convert_to_numpy=True
+                    )
+                
+                # #region agent log
+                encode_duration = time.time() - encode_start
+                try:
+                    with open(log_path, 'a', encoding='utf-8') as log_file:
+                        import json as json_lib
+                        log_entry = {
+                            "sessionId": "perf-test",
+                            "runId": "run1",
+                            "hypothesisId": "ENCODE_SUCCESS",
+                            "location": "text_processor.py:960",
+                            "message": "model.encode completed successfully",
+                            "data": {
+                                "duration_seconds": encode_duration,
+                                "embeddings_shape": list(embeddings.shape) if hasattr(embeddings, 'shape') else "unknown",
+                                "num_sentences": len(sentence_list)
+                            },
+                            "timestamp": int(time.time() * 1000)
+                        }
+                        log_file.write(json_lib.dumps(log_entry) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+                
+            except (TypeError, ValueError) as e:
+                # #region agent log
+                encode_duration = time.time() - encode_start if 'encode_start' in locals() else 0
+                try:
+                    with open(log_path, 'a', encoding='utf-8') as log_file:
+                        import json as json_lib
+                        log_entry = {
+                            "sessionId": "perf-test",
+                            "runId": "run1",
+                            "hypothesisId": "ENCODE_ERROR",
+                            "location": "text_processor.py:980",
+                            "message": "model.encode failed, trying fallback",
+                            "data": {
+                                "duration_seconds": encode_duration,
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "num_sentences": len(sentence_list)
+                            },
+                            "timestamp": int(time.time() * 1000)
+                        }
+                        log_file.write(json_lib.dumps(log_entry) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+                
+                # If still getting TypeError, try with a simpler call
+                logger.warning(f"TypeError/ValueError in model.encode, trying simpler call: {e}")
+                try:
+                    # #region agent log
+                    fallback_start = time.time()
+                    # #endregion
+                    embeddings = self.model.encode(sentence_list, convert_to_numpy=True)
+                    # #region agent log
+                    fallback_duration = time.time() - fallback_start
+                    try:
+                        with open(log_path, 'a', encoding='utf-8') as log_file:
+                            import json as json_lib
+                            log_entry = {
+                                "sessionId": "perf-test",
+                                "runId": "run1",
+                                "hypothesisId": "ENCODE_FALLBACK_SUCCESS",
+                                "location": "text_processor.py:1000",
+                                "message": "Fallback encode succeeded",
+                                "data": {
+                                    "duration_seconds": fallback_duration
+                                },
+                                "timestamp": int(time.time() * 1000)
+                            }
+                            log_file.write(json_lib.dumps(log_entry) + "\n")
+                    except Exception:
+                        pass
+                    # #endregion
+                except Exception as e2:
+                    # #region agent log
+                    try:
+                        with open(log_path, 'a', encoding='utf-8') as log_file:
+                            import json as json_lib
+                            log_entry = {
+                                "sessionId": "perf-test",
+                                "runId": "run1",
+                                "hypothesisId": "ENCODE_FALLBACK_FAILED",
+                                "location": "text_processor.py:1015",
+                                "message": "Fallback encode also failed, using fixed chunking",
+                                "data": {
+                                    "error": str(e2),
+                                    "error_type": type(e2).__name__
+                                },
+                                "timestamp": int(time.time() * 1000)
+                            }
+                            log_file.write(json_lib.dumps(log_entry) + "\n")
+                    except Exception:
+                        pass
+                    # #endregion
+                    logger.error(f"Failed to encode sentences even with simple call: {e2}")
+                    return self._chunk_fixed(text, metadata)
+            # #region agent log
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    import time
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "C",
+                        "location": "text_processor.py:680",
+                        "message": "After chunking encode",
+                        "data": {
+                            "embeddings_shape": list(embeddings.shape) if hasattr(embeddings, 'shape') else "unknown",
+                            "use_mixed_precision": use_mixed_precision
+                        },
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+            # #endregion
         except Exception as e:
+            # #region agent log
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    import time
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "B",
+                        "location": "text_processor.py:982",
+                        "message": "Chunking encode failed - falling back to fixed chunking",
+                        "data": {
+                            "error": str(e),
+                            "error_type": type(e).__name__
+                        },
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+            except Exception:
+                pass
+            # #endregion
             logger.warning(f"Semantic chunking failed: {e}. Falling back to fixed chunking.")
             return self._chunk_fixed(text, metadata)
         

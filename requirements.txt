@@ -33,3 +33,4 @@ pyarrow>=14.0.0
 # Optional: For better performance
 faiss-cpu>=1.7.4
 
+aiofiles>=23.2.0

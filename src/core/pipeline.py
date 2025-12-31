@@ -6,6 +6,8 @@ Orchestrates the complete pipeline from PDF extraction to vector store indexing.
 import os
 import json
 import sqlite3
+import time
+import psutil
 from pathlib import Path
 from typing import List, Dict, Optional
 from tqdm import tqdm
@@ -20,6 +22,12 @@ from ..processors.text_processor import TextProcessor, TextChunker
 from ..embeddings.embedder import Embedder
 from ..storage.vector_store import VectorStore
 
+# Import memory optimizer
+try:
+    from .memory_optimizer import MemoryOptimizer
+except ImportError:
+    MemoryOptimizer = None
+
 # Import worker function for multiprocessing
 try:
     from .worker import _process_paper_worker
@@ -31,16 +39,58 @@ except ImportError:
 class RAGPipeline:
     """Complete RAG pipeline for processing ArXiv papers."""
     
-    def __init__(self, config_path: str = "config.yaml"):
+    def __init__(self, config_path: str = "config.yaml", enable_memory_optimization: bool = True):
         """Initialize pipeline with configuration."""
         # Load configuration
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
         
-        # Initialize components
+        # Setup memory optimization if enabled
+        self.memory_optimizer = None
+        if enable_memory_optimization and MemoryOptimizer:
+            try:
+                self.memory_optimizer = MemoryOptimizer(
+                    use_ram_disk=self.config.get('memory_optimization', {}).get('use_ram_disk', True),
+                    ram_disk_size_gb=self.config.get('memory_optimization', {}).get('ram_disk_size_gb', 20),
+                    enable_model_caching=self.config.get('memory_optimization', {}).get('enable_model_caching', True),
+                    max_workers=self.config.get('processing', {}).get('num_workers', 12)
+                )
+                
+                # Setup RAM disk for cache
+                ram_disk_path = self.memory_optimizer.setup_ram_disk()
+                if ram_disk_path:
+                    logger.info(f"Memory optimization enabled. RAM disk: {ram_disk_path}")
+                
+                # Optimize configuration
+                self.config = self.memory_optimizer.optimize_worker_memory(self.config)
+                
+                # Log memory stats
+                mem_stats = self.memory_optimizer.get_memory_stats()
+                if mem_stats:
+                    logger.info(f"Memory stats: {mem_stats.get('system_available_gb', 0):.1f}GB available "
+                              f"({mem_stats.get('system_free_percent', 0):.1f}% free)")
+                    
+                    # Recommend worker count
+                    recommended = self.memory_optimizer.recommend_worker_count()
+                    current = self.config.get('processing', {}).get('num_workers', 12)
+                    if recommended != current:
+                        logger.info(f"💡 Memory-based recommendation: {recommended} workers (current: {current})")
+                        logger.info(f"   Consider updating num_workers in config.yaml if you want to use more RAM")
+            except Exception as e:
+                logger.warning(f"Memory optimization setup failed: {e}. Continuing without optimization.")
+                self.memory_optimizer = None
+        
+        # Initialize components with memory-optimized cache if available
+        cache_dir = None
+        if self.memory_optimizer:
+            base_cache = Path.home() / '.arxiv_rag_cache'
+            cache_dir = str(self.memory_optimizer.get_cache_directory(base_cache))
+        
         self.pdf_extractor = PDFExtractor(
             enable_ocr=self.config['pdf_extraction']['enable_ocr'],
-            ocr_language=self.config['pdf_extraction']['ocr_language']
+            ocr_language=self.config['pdf_extraction']['ocr_language'],
+            enable_caching=self.config.get('pdf_extraction', {}).get('enable_caching', True),
+            cache_dir=cache_dir
         )
         
         self.text_processor = TextProcessor(
@@ -56,7 +106,10 @@ class RAGPipeline:
             chunk_overlap=self.config['chunking']['chunk_overlap'],
             model_name=self.config['chunking'].get('model'),
             min_chunk_size=self.config['text_processing']['min_chunk_size'],
-            max_chunk_size=self.config['text_processing']['max_chunk_size']
+            max_chunk_size=self.config['text_processing']['max_chunk_size'],
+            device=self.config['chunking'].get('device', 'cpu'),
+            batch_size=self.config['chunking'].get('batch_size', 512),
+            enable_mixed_precision=self.config['chunking'].get('enable_mixed_precision', True)
         )
         
         # Initialize embeddings only if needed during processing
@@ -67,7 +120,9 @@ class RAGPipeline:
                     model_name=self.config['embeddings']['model'],
                     batch_size=self.config['embeddings']['batch_size'],
                     device=self.config['embeddings']['device'],
-                    normalize_embeddings=self.config['embeddings']['normalize_embeddings']
+                    normalize_embeddings=self.config['embeddings']['normalize_embeddings'],
+                    enable_mixed_precision=self.config['embeddings'].get('enable_mixed_precision', True),
+                    enable_pipelining=self.config['embeddings'].get('enable_pipelining', False)
                 )
             except ImportError:
                 logger.warning("Embeddings not available, will skip embedding generation during processing")
@@ -124,6 +179,19 @@ class RAGPipeline:
         self.progress_db_path = Path(self.config['paths'].get('progress_db', 'data/progress.db'))
         self.progress_db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_progress_db()
+        
+        # Initialize advanced optimizer if enabled
+        self.advanced_optimizer = None
+        if self.config.get('advanced_optimization', {}).get('enable_preloading', False) or \
+           self.config.get('advanced_optimization', {}).get('enable_async_io', False):
+            try:
+                from .advanced_optimizations import create_advanced_optimizer
+                self.advanced_optimizer = create_advanced_optimizer(self.config)
+                if self.advanced_optimizer:
+                    self.advanced_optimizer.setup_pdf_cache(self.pdf_dir)
+                    logger.info("Advanced optimizer initialized (PDF cache + Async I/O)")
+            except Exception as e:
+                logger.warning(f"Advanced optimizer setup failed: {e}. Continuing without it.")
         
         logger.info("RAG Pipeline initialized")
     
@@ -431,6 +499,32 @@ class RAGPipeline:
     
     def process_batch(self, paper_ids: List[str], batch_size: Optional[int] = None, 
                       skip_processed: bool = True, num_workers: Optional[int] = None) -> Dict:
+        # #region agent log
+        log_path = Path("/Volumes/8SSD/ArxivCS/arxiv-rag/.cursor/debug.log")
+        original_count = len(paper_ids)  # Store original count at function start
+        skipped = 0  # Initialize skipped count
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                log_entry = {
+                    "sessionId": "perf-test",
+                    "runId": "run1",
+                    "hypothesisId": "PROCESS_BATCH_ENTRY",
+                    "location": "pipeline.py:500",
+                    "message": "process_batch method entered",
+                    "data": {
+                        "num_papers": len(paper_ids),
+                        "batch_size": batch_size,
+                        "skip_processed": skip_processed,
+                        "num_workers": num_workers
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+                log_file.flush()
+        except Exception:
+            pass
+        # #endregion
         """
         Process a batch of papers with parallel processing.
         
@@ -443,12 +537,75 @@ class RAGPipeline:
         Returns:
             Dictionary with processing statistics
         """
+        # #region agent log
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                log_entry = {
+                    "sessionId": "perf-test",
+                    "runId": "run1",
+                    "hypothesisId": "BEFORE_CONFIG_READ",
+                    "location": "pipeline.py:514",
+                    "message": "About to read config for batch_size and num_workers",
+                    "data": {},
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+                log_file.flush()
+        except Exception:
+            pass
+        # #endregion
+        
         batch_size = batch_size or self.config['processing']['batch_size']
         num_workers = num_workers or self.config['processing']['num_workers']
+        
+        # #region agent log
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                log_entry = {
+                    "sessionId": "perf-test",
+                    "runId": "run1",
+                    "hypothesisId": "AFTER_CONFIG_READ",
+                    "location": "pipeline.py:530",
+                    "message": "Config read, about to filter paper_ids",
+                    "data": {
+                        "batch_size": batch_size,
+                        "num_workers": num_workers
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+                log_file.flush()
+        except Exception:
+            pass
+        # #endregion
         
         # Filter out macOS resource fork files (._*)
         original_count = len(paper_ids)
         paper_ids = [pid for pid in paper_ids if not pid.startswith('._')]
+        
+        # #region agent log
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                log_entry = {
+                    "sessionId": "perf-test",
+                    "runId": "run1",
+                    "hypothesisId": "AFTER_FILTER",
+                    "location": "pipeline.py:550",
+                    "message": "Paper IDs filtered",
+                    "data": {
+                        "original_count": original_count,
+                        "filtered_count": len(paper_ids)
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+                log_file.flush()
+        except Exception:
+            pass
+        # #endregion
         macos_filtered = original_count - len(paper_ids)
         if macos_filtered > 0:
             logger.info(f"Filtered out {macos_filtered} macOS resource fork files")
@@ -459,7 +616,7 @@ class RAGPipeline:
             original_count = len(paper_ids)
             logger.info(f"Checking {original_count} papers for already processed status...")
             # #region agent log
-            log_path = Path("/Volumes/8SSD/ArxivCS/.cursor/debug.log")
+            log_path = Path("/Volumes/8SSD/ArxivCS/arxiv-rag/.cursor/debug.log")
             try:
                 with open(log_path, 'a', encoding='utf-8') as log_file:
                     import json as json_lib
@@ -480,6 +637,28 @@ class RAGPipeline:
                 pass
             # #endregion
             
+            # #region agent log
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    log_entry = {
+                        "sessionId": "perf-test",
+                        "runId": "run1",
+                        "hypothesisId": "BEFORE_DB_CHECK",
+                        "location": "pipeline.py:576",
+                        "message": "About to check database for processed papers",
+                        "data": {
+                            "num_papers": len(paper_ids),
+                            "db_path": str(self.progress_db_path)
+                        },
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+                    log_file.flush()
+            except Exception:
+                pass
+            # #endregion
+            
             # Batch check for processed papers (more efficient)
             import sqlite3
             conn = sqlite3.connect(str(self.progress_db_path))
@@ -488,6 +667,27 @@ class RAGPipeline:
             cursor.execute(f'SELECT paper_id FROM processed_papers WHERE paper_id IN ({placeholders}) AND status="success"', paper_ids)
             processed_set = set(row[0] for row in cursor.fetchall())
             conn.close()
+            
+            # #region agent log
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    log_entry = {
+                        "sessionId": "perf-test",
+                        "runId": "run1",
+                        "hypothesisId": "AFTER_DB_CHECK",
+                        "location": "pipeline.py:590",
+                        "message": "Database check completed",
+                        "data": {
+                            "processed_count": len(processed_set)
+                        },
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+                    log_file.flush()
+            except Exception:
+                pass
+            # #endregion
             
             # Also check for existing JSON files
             existing_files = {f.stem for f in self.extracted_text_dir.glob("*.json") if not f.name.startswith('._')}
@@ -520,8 +720,51 @@ class RAGPipeline:
             if skipped > 0:
                 logger.info(f"Skipping {skipped} already processed papers")
         
+        # #region agent log
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                log_entry = {
+                    "sessionId": "perf-test",
+                    "runId": "run1",
+                    "hypothesisId": "BEFORE_PAPER_IDS_CHECK",
+                    "location": "pipeline.py:720",
+                    "message": "About to check if paper_ids is empty",
+                    "data": {
+                        "paper_ids_count": len(paper_ids),
+                        "skipped": skipped
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+                log_file.flush()
+        except Exception:
+            pass
+        # #endregion
+        
         if not paper_ids:
             logger.info("All papers already processed")
+            # #region agent log
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_file:
+                    import json as json_lib
+                    log_entry = {
+                        "sessionId": "perf-test",
+                        "runId": "run1",
+                        "hypothesisId": "ALL_PAPERS_SKIPPED",
+                        "location": "pipeline.py:615",
+                        "message": "All papers already processed, returning early",
+                        "data": {
+                            "total": original_count if skip_processed else 0,
+                            "skipped": skipped
+                        },
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    log_file.write(json_lib.dumps(log_entry) + "\n")
+                    log_file.flush()
+            except Exception:
+                pass
+            # #endregion
             return {
                 'total': original_count if skip_processed else 0,
                 'successful': skipped,
@@ -538,12 +781,95 @@ class RAGPipeline:
             'errors': []
         }
         
+        # Preload first batch of PDFs if advanced optimizer is enabled
+        if self.advanced_optimizer and self.advanced_optimizer.enable_preloading:
+            first_batch = paper_ids[:min(batch_size, len(paper_ids))]
+            logger.info(f"Preloading {len(first_batch)} PDFs into memory cache...")
+            self.advanced_optimizer.preload_pdfs(first_batch, background=True)
+        
         # Process in batches with parallel workers
         total_batches = (len(paper_ids) + batch_size - 1) // batch_size
+        
+        # #region agent log
+        try:
+            import psutil
+            psutil_available = True
+        except ImportError:
+            psutil_available = False
+        overall_start_time = time.time()
+        log_path = Path("/Volumes/8SSD/ArxivCS/arxiv-rag/.cursor/debug.log")
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                if psutil_available:
+                    process = psutil.Process(os.getpid())
+                    mem_info = process.memory_info()
+                    initial_memory_mb = mem_info.rss / 1024 / 1024
+                    cpu_count = psutil.cpu_count()
+                else:
+                    initial_memory_mb = 0
+                    cpu_count = os.cpu_count() or 0
+                log_entry = {
+                    "sessionId": "perf-test",
+                    "runId": "run1",
+                    "hypothesisId": "PERF_START",
+                    "location": "pipeline.py:613",
+                    "message": "Batch processing started",
+                    "data": {
+                        "total_papers": len(paper_ids),
+                        "batch_size": batch_size,
+                        "num_workers": num_workers,
+                        "total_batches": total_batches,
+                        "initial_memory_mb": initial_memory_mb,
+                        "cpu_count": cpu_count
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
         
         with tqdm(total=len(paper_ids), desc="Processing papers") as pbar:
             for batch_idx in range(0, len(paper_ids), batch_size):
                 batch = paper_ids[batch_idx:batch_idx + batch_size]
+                
+                # #region agent log
+                batch_start_time = time.time()
+                try:
+                    with open(log_path, 'a', encoding='utf-8') as log_file:
+                        import json as json_lib
+                        if psutil_available:
+                            process = psutil.Process(os.getpid())
+                            mem_info = process.memory_info()
+                            memory_mb = mem_info.rss / 1024 / 1024
+                            cpu_percent = psutil.cpu_percent(interval=0.1)
+                        else:
+                            memory_mb = 0
+                            cpu_percent = 0
+                        log_entry = {
+                            "sessionId": "perf-test",
+                            "runId": "run1",
+                            "hypothesisId": "BATCH_START",
+                            "location": "pipeline.py:617",
+                            "message": "Batch processing started",
+                            "data": {
+                                "batch_idx": batch_idx // batch_size + 1,
+                                "batch_size": len(batch),
+                                "papers_processed_so_far": batch_idx,
+                                "memory_mb": memory_mb,
+                                "cpu_percent": cpu_percent
+                            },
+                            "timestamp": int(time.time() * 1000)
+                        }
+                        log_file.write(json_lib.dumps(log_entry) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+                
+                # Preload next batch while processing current batch
+                if self.advanced_optimizer and self.advanced_optimizer.enable_preloading:
+                    self.advanced_optimizer.preload_next_batch(batch, paper_ids)
                 
                 # Process batch in parallel
                 if _process_paper_worker is None:
@@ -587,15 +913,78 @@ class RAGPipeline:
                     batch_db_records = []
                     batch_size_db = 50  # Write to DB every 50 papers
                     
+                    # #region agent log
+                    try:
+                        with open(log_path, 'a', encoding='utf-8') as log_file:
+                            import json as json_lib
+                            log_entry = {
+                                "sessionId": "perf-test",
+                                "runId": "run1",
+                                "hypothesisId": "BEFORE_EXECUTOR",
+                                "location": "pipeline.py:741",
+                                "message": "About to create ProcessPoolExecutor",
+                                "data": {
+                                    "batch_idx": batch_idx // batch_size + 1,
+                                    "batch_size": len(batch),
+                                    "num_workers": num_workers
+                                },
+                                "timestamp": int(time.time() * 1000)
+                            }
+                            log_file.write(json_lib.dumps(log_entry) + "\n")
+                    except Exception:
+                        pass
+                    # #endregion
+                    
                     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                        # Submit all papers in batch
                         # #region agent log
-                        log_path = Path("/Volumes/8SSD/ArxivCS/.cursor/debug.log")
                         try:
                             with open(log_path, 'a', encoding='utf-8') as log_file:
                                 import json as json_lib
                                 log_entry = {
-                                    "sessionId": "debug-session",
+                                    "sessionId": "perf-test",
+                                    "runId": "run1",
+                                    "hypothesisId": "EXECUTOR_CREATED",
+                                    "location": "pipeline.py:760",
+                                    "message": "ProcessPoolExecutor created",
+                                    "data": {
+                                        "batch_idx": batch_idx // batch_size + 1,
+                                        "num_workers": num_workers
+                                    },
+                                    "timestamp": int(time.time() * 1000)
+                                }
+                                log_file.write(json_lib.dumps(log_entry) + "\n")
+                        except Exception:
+                            pass
+                        # #endregion
+                        # Submit all papers in batch
+                        # #region agent log
+                        try:
+                            with open(log_path, 'a', encoding='utf-8') as log_file:
+                                import json as json_lib
+                                log_entry = {
+                                    "sessionId": "perf-test",
+                                    "runId": "run1",
+                                    "hypothesisId": "BEFORE_SUBMIT",
+                                    "location": "pipeline.py:790",
+                                    "message": "About to submit workers",
+                                    "data": {
+                                        "batch_idx": batch_idx // batch_size + 1,
+                                        "batch_size": len(batch),
+                                        "num_papers": len(batch)
+                                    },
+                                    "timestamp": int(time.time() * 1000)
+                                }
+                                log_file.write(json_lib.dumps(log_entry) + "\n")
+                        except Exception:
+                            pass
+                        # #endregion
+                        
+                        # #region agent log
+                        try:
+                            with open(log_path, 'a', encoding='utf-8') as log_file:
+                                import json as json_lib
+                                log_entry = {
+                                    "sessionId": "perf-test",
                                     "runId": "run1",
                                     "hypothesisId": "H",
                                     "location": "pipeline.py:477",
@@ -613,18 +1002,106 @@ class RAGPipeline:
                             pass
                         # #endregion
                         
+                        # #region agent log
+                        try:
+                            with open(log_path, 'a', encoding='utf-8') as log_file:
+                                import json as json_lib
+                                log_entry = {
+                                    "sessionId": "perf-test",
+                                    "runId": "run1",
+                                    "hypothesisId": "SUBMITTING_WORKERS",
+                                    "location": "pipeline.py:800",
+                                    "message": "Submitting workers to executor",
+                                    "data": {
+                                        "batch_idx": batch_idx // batch_size + 1,
+                                        "num_papers": len(batch),
+                                        "paper_ids": list(batch)[:5]  # First 5 for logging
+                                    },
+                                    "timestamp": int(time.time() * 1000)
+                                }
+                                log_file.write(json_lib.dumps(log_entry) + "\n")
+                        except Exception:
+                            pass
+                        # #endregion
+                        
                         future_to_paper = {
                             executor.submit(_process_paper_worker, str(self.pdf_dir.resolve()), 
                                            str(self.metadata_dir.resolve()), str(self.extracted_text_dir.resolve()),
                                            str(self.progress_db_path.resolve()), paper_id, self.config): paper_id
                             for paper_id in batch
                         }
+                        
+                        # #region agent log
+                        try:
+                            with open(log_path, 'a', encoding='utf-8') as log_file:
+                                import json as json_lib
+                                log_entry = {
+                                    "sessionId": "perf-test",
+                                    "runId": "run1",
+                                    "hypothesisId": "WORKERS_SUBMITTED",
+                                    "location": "pipeline.py:815",
+                                    "message": "All workers submitted to executor",
+                                    "data": {
+                                        "batch_idx": batch_idx // batch_size + 1,
+                                        "num_futures": len(future_to_paper)
+                                    },
+                                    "timestamp": int(time.time() * 1000)
+                                }
+                                log_file.write(json_lib.dumps(log_entry) + "\n")
+                        except Exception:
+                            pass
+                        # #endregion
                     
                         # Collect results as they complete
                         for future in as_completed(future_to_paper):
                             paper_id = future_to_paper[future]
+                            # #region agent log
+                            try:
+                                with open(log_path, 'a', encoding='utf-8') as log_file:
+                                    import json as json_lib
+                                    log_entry = {
+                                        "sessionId": "perf-test",
+                                        "runId": "run1",
+                                        "hypothesisId": "BEFORE_FUTURE_RESULT",
+                                        "location": "pipeline.py:881",
+                                        "message": "About to get future.result()",
+                                        "data": {
+                                            "paper_id": paper_id,
+                                            "future_done": future.done(),
+                                            "future_cancelled": future.cancelled()
+                                        },
+                                        "timestamp": int(time.time() * 1000)
+                                    }
+                                    log_file.write(json_lib.dumps(log_entry) + "\n")
+                            except Exception:
+                                pass
+                            # #endregion
+                            
                             try:
                                 result = future.result()
+                                # #region agent log
+                                try:
+                                    with open(log_path, 'a', encoding='utf-8') as log_file:
+                                        import json as json_lib
+                                        log_entry = {
+                                            "sessionId": "perf-test",
+                                            "runId": "run1",
+                                            "hypothesisId": "FUTURE_RESULT_RECEIVED",
+                                            "location": "pipeline.py:900",
+                                            "message": "future.result() returned",
+                                            "data": {
+                                                "paper_id": paper_id,
+                                                "result_success": result.get('success') if result else None,
+                                                "result_error": result.get('error') if result else None,
+                                                "result_is_none": result is None
+                                            },
+                                            "timestamp": int(time.time() * 1000)
+                                        }
+                                        log_file.write(json_lib.dumps(log_entry) + "\n")
+                                except Exception:
+                                    pass
+                                # #endregion
+                                
                                 if result and result.get('success'):
                                     results['successful'] += 1
                                     batch_db_records.append((
@@ -644,6 +1121,28 @@ class RAGPipeline:
                                         'error': error_msg
                                     })
                             except Exception as e:
+                                # #region agent log
+                                try:
+                                    with open(log_path, 'a', encoding='utf-8') as log_file:
+                                        import json as json_lib
+                                        log_entry = {
+                                            "sessionId": "perf-test",
+                                            "runId": "run1",
+                                            "hypothesisId": "FUTURE_RESULT_EXCEPTION",
+                                            "location": "pipeline.py:930",
+                                            "message": "Exception getting future.result()",
+                                            "data": {
+                                                "paper_id": paper_id,
+                                                "error": str(e),
+                                                "error_type": type(e).__name__
+                                            },
+                                            "timestamp": int(time.time() * 1000)
+                                        }
+                                        log_file.write(json_lib.dumps(log_entry) + "\n")
+                                except Exception:
+                                    pass
+                                # #endregion
+                                
                                 results['failed'] += 1
                                 error_msg = str(e)
                                 batch_db_records.append((
@@ -664,6 +1163,75 @@ class RAGPipeline:
                     # Write remaining records
                     if batch_db_records:
                         self._mark_processed_batch(batch_db_records)
+                
+                # #region agent log
+                batch_end_time = time.time()
+                batch_duration = batch_end_time - batch_start_time
+                try:
+                    with open(log_path, 'a', encoding='utf-8') as log_file:
+                        import json as json_lib
+                        if psutil_available:
+                            process = psutil.Process(os.getpid())
+                            mem_info = process.memory_info()
+                            memory_mb = mem_info.rss / 1024 / 1024
+                            cpu_percent = psutil.cpu_percent(interval=0.1)
+                        else:
+                            memory_mb = 0
+                            cpu_percent = 0
+                        log_entry = {
+                            "sessionId": "perf-test",
+                            "runId": "run1",
+                            "hypothesisId": "BATCH_END",
+                            "location": "pipeline.py:742",
+                            "message": "Batch processing completed",
+                            "data": {
+                                "batch_idx": batch_idx // batch_size + 1,
+                                "batch_size": len(batch),
+                                "duration_seconds": batch_duration,
+                                "papers_per_second": len(batch) / batch_duration if batch_duration > 0 else 0,
+                                "memory_mb": memory_mb,
+                                "cpu_percent": cpu_percent
+                            },
+                            "timestamp": int(time.time() * 1000)
+                        }
+                        log_file.write(json_lib.dumps(log_entry) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+        
+        # #region agent log
+        overall_end_time = time.time()
+        overall_duration = overall_end_time - overall_start_time
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                import json as json_lib
+                if psutil_available:
+                    process = psutil.Process(os.getpid())
+                    mem_info = process.memory_info()
+                    final_memory_mb = mem_info.rss / 1024 / 1024
+                else:
+                    final_memory_mb = 0
+                log_entry = {
+                    "sessionId": "perf-test",
+                    "runId": "run1",
+                    "hypothesisId": "PERF_END",
+                    "location": "pipeline.py:744",
+                    "message": "Overall batch processing completed",
+                    "data": {
+                        "total_papers": len(paper_ids),
+                        "successful": results['successful'],
+                        "failed": results['failed'],
+                        "total_duration_seconds": overall_duration,
+                        "papers_per_second": results['successful'] / overall_duration if overall_duration > 0 else 0,
+                        "papers_per_hour": (results['successful'] / overall_duration * 3600) if overall_duration > 0 else 0,
+                        "final_memory_mb": final_memory_mb
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }
+                log_file.write(json_lib.dumps(log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
         
         logger.info(f"Batch processing complete: {results['successful']} successful, {results['failed']} failed")
         return results
@@ -692,7 +1260,7 @@ class RAGPipeline:
     
     def get_stats(self) -> Dict:
         """Get statistics about the processed data."""
-        vector_stats = self.vector_store.get_stats() if hasattr(self, 'vector_store') else {}
+        vector_stats = self.vector_store.get_stats() if (hasattr(self, 'vector_store') and self.vector_store is not None) else {}
         
         # Count processed papers
         processed_files = list(self.extracted_text_dir.glob("*.json"))
