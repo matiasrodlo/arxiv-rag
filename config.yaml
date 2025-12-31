@@ -66,7 +66,7 @@ retrieval:
 # Processing
 processing:
   batch_size: 1000  # Papers per batch (optimized for 800K papers, was 500)
-  num_workers: 14  # Parallel workers (optimized for stability: avg 53.3%, max 99.8% with 16 workers, reduced to 14 for headroom)
+  num_workers: 12  # Parallel workers (optimized for long-run stability: 14 workers showed 98.2% CPU peaks, reduced to 12 for better stability over 9+ day runs)
   max_retries: 3
   retry_delay: 1  # seconds
   skip_processed: true  # Skip papers that are already processed
