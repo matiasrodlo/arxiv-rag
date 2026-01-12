@@ -1,0 +1,101 @@
+# RAG System Configuration
+
+# Paths
+paths:
+  pdf_dir: "/Volumes/8SSD/DOIS/pdfs"
+  metadata_dir: "/Volumes/8SSD/DOIS/shunks"
+  output_dir: "/Volumes/8SSD/DOIS/output"
+  vector_db_path: "/Volumes/8SSD/DOIS/data/vector_db"
+  extracted_text_dir: "/Volumes/8SSD/DOIS/output"
+  progress_db: "/Volumes/8SSD/DOIS/data/progress.db"  # SQLite database for progress tracking
+
+# PDF Extraction
+pdf_extraction:
+  primary_library: "pymupdf"  # pymupdf, pdfplumber, pypdf
+  enable_ocr: true
+  ocr_language: "eng"
+  min_text_length: 100  # Minimum characters to consider valid
+  extract_metadata: true
+  extract_references: true
+
+# Text Processing
+text_processing:
+  remove_headers_footers: true
+  normalize_whitespace: true
+  fix_encoding: true
+  improve_formulas: true  # Improve mathematical formula formatting
+  min_chunk_size: 200  # Minimum characters per chunk (increased for better quality)
+  max_chunk_size: 2000  # Maximum characters per chunk (increased for better context, was 1000)
+  chunk_overlap: 400  # Overlap between chunks in characters (increased, was 200)
+  preserve_sections: true
+
+# Chunking
+chunking:
+  method: "semantic"  # semantic, fixed, sentence
+  chunk_size: 1024  # tokens (increased for better context, was 512)
+  chunk_overlap: 100  # tokens (increased for better continuity, was 50)
+  model: "sentence-transformers/all-MiniLM-L6-v2"  # For semantic chunking
+  device: "mps"  # Use Metal Performance Shaders (Apple GPU) for chunking - offloads CPU work
+  batch_size: 512  # Larger batches for better GPU utilization (chunking operations)
+  enable_mixed_precision: true  # Use FP16 for faster GPU inference
+
+# Embeddings
+embeddings:
+  model: "sentence-transformers/all-mpnet-base-v2"  # High-quality model for 128GB RAM
+  batch_size: 1024  # Increased from 512 - maximize GPU utilization (M4 Max can handle large batches)
+  device: "mps"  # Use Metal Performance Shaders (Apple GPU) for maximum speed
+  normalize_embeddings: true
+  generate_during_processing: false  # Set to false for large-scale: generate embeddings in separate batch step
+  enable_mixed_precision: true  # Use FP16 for faster GPU inference (2x speedup)
+  enable_pipelining: true  # Pipeline GPU operations to keep GPU busy
+
+# Vector Database
+vector_db:
+  type: "chroma"  # chroma, qdrant
+  collection_name: "arxiv_cs_papers"
+  persist_directory: "/Volumes/8SSD/DOIS/data/vector_db"
+  add_during_processing: false  # Set to false for large-scale: add to vector store in separate batch step
+  # For Qdrant:
+  # qdrant_host: "localhost"
+  # qdrant_port: 6333
+
+# Retrieval
+retrieval:
+  top_k: 10
+  use_hybrid_search: true
+  hybrid_alpha: 0.7  # Weight for semantic search (0.7) vs keyword (0.3)
+  use_reranking: true
+  rerank_top_k: 50  # Re-rank top 50, return top 10
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# Processing
+processing:
+  batch_size: 2000  # Papers per batch (increased from 1000 - better CPU utilization with 128GB RAM)
+  num_workers: 24  # Parallel workers (increased from 20 - test incrementally, can go to 28 with 128GB RAM)
+  max_retries: 3
+  retry_delay: 1  # seconds
+  skip_processed: true  # Skip papers that are already processed
+  checkpoint_interval: 100  # Save progress every N papers
+
+# Memory Optimization (uses idle RAM to reduce CPU bottlenecks)
+memory_optimization:
+  use_ram_disk: true  # Use RAM disk for PDF extraction cache (faster I/O = less CPU wait)
+  ram_disk_size_gb: 30  # Size of RAM disk in GB (increased from 20 - more cache with 128GB RAM)
+  enable_model_caching: true  # Cache models in memory (reduces reload overhead)
+  # Note: With 128GB RAM, you can use 24-28 workers safely
+  # The system will recommend optimal worker count based on available RAM
+
+# Advanced Optimizations (M4 Max specific)
+advanced_optimization:
+  enable_preloading: true  # Pre-load PDFs into memory (eliminates I/O wait)
+  pdf_cache_size_mb: 10000  # PDF cache size in MB (10GB - plenty of RAM available)
+  enable_async_io: true  # Use async I/O operations (CPU doesn't wait for disk)
+  async_io_workers: 8  # Number of concurrent async I/O operations
+  # Note: These optimizations use more RAM but significantly reduce CPU bottlenecks
+
+# Logging
+logging:
+  level: "INFO"
+  log_file: "/Volumes/8SSD/DOIS/logs/rag_pipeline.log"
+  log_rotation: "100 MB"
+
