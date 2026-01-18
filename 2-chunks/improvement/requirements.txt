@@ -1,0 +1,15 @@
+# Requirements for chunk quality improvement script
+# Install with: pip install -r requirements_chunk_improvement.txt
+
+# For sentence detection (recommended)
+spacy>=3.4.0
+
+# For semantic coherence (optional but recommended)
+sentence-transformers>=2.2.0
+numpy>=1.21.0
+
+# For token-based chunk sizing (optional but recommended)
+tiktoken>=0.5.0
+
+# Note: After installing spacy, download the English model:
+# python -m spacy download en_core_web_sm
