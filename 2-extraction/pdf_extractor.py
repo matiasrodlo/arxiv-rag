@@ -1,6 +1,7 @@
 """
 PDF Text Extraction Module with Multi-Library Fallback
 Handles robust extraction from various PDF formats including scanned documents.
+Default PDF input directory is set to /Volumes/8SSD/paper/pdfs.
 """
 
 import os
@@ -41,6 +42,8 @@ except ImportError:
     OCR_AVAILABLE = False
     logger.warning("OCR libraries not available")
 
+
+DEFAULT_PDF_INPUT_DIR = Path('/Volumes/8SSD/paper/pdfs')
 
 class PDFExtractor:
     """Extract text from PDFs with multiple fallback methods."""
@@ -305,6 +308,40 @@ class PDFExtractor:
             'modification_date': doc.metadata.get('modDate', ''),
             'page_count': len(doc)
         }
+        # Fix possible inversion of title/author (common in some PDFs)
+        if metadata['title'] and metadata['author']:
+            t = metadata['title'].lower()
+            a = metadata['author'].lower()
+            # Heuristic: title often contains "and" or "eds." while author looks like workshop/event name
+            if (('and' in t or 'eds.' in t) and not ('and' in a or 'eds.' in a)):
+                metadata['title'], metadata['author'] = metadata['author'], metadata['title']
+        # Infer missing title/author from first page if still empty
+        if not metadata['title'] or not metadata['author']:
+            try:
+                first_page = doc.load_page(0)
+                page_text = first_page.get_text("text")
+                lines = [ln.strip() for ln in page_text.split('\n') if ln.strip()]
+                if lines:
+                    if not metadata['title']:
+                        metadata['title'] = lines[0]
+                    if len(lines) > 1 and not metadata['author']:
+                        metadata['author'] = lines[1]
+            except Exception:
+                pass
+        # Infer missing title/author from first page if metadata empty
+        if not metadata['title'] or not metadata['author']:
+            try:
+                first_page = doc.load_page(0)
+                page_text = first_page.get_text("text")
+                lines = [ln.strip() for ln in page_text.split('\n') if ln.strip()]
+                if lines:
+                    # Heuristic: first line likely title, second line author
+                    if not metadata['title']:
+                        metadata['title'] = lines[0]
+                    if len(lines) > 1 and not metadata['author']:
+                        metadata['author'] = lines[1]
+            except Exception:
+                pass
         
         # Check if we should use parallel processing
         # Optimized thresholds: >30 pages OR >30 MB (reduces overhead for smaller PDFs)
@@ -824,12 +861,14 @@ class PDFExtractor:
             full_text_combined = '\n\n'.join(full_text)
             full_text_combined = self._post_process_extracted_text(full_text_combined)
             
-            return {
-                'text': full_text_combined,
-                'metadata': metadata,
-                'pages': text_pages,
-                'method_used': 'pdfplumber'
-            }
+        return {
+            'text': full_text_combined,
+            'metadata': metadata,
+            'pages': text_pages,
+            'method_used': 'pdfplumber',
+            # Include extracted tables (list of 2‑D arrays) if any were found
+            'tables': all_tables if 'all_tables' in locals() else []
+        }
     
     def _reconstruct_text_from_words(self, words: List[Dict]) -> str:
         """Reconstruct text from word list with proper spacing."""
