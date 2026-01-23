@@ -666,7 +666,7 @@ class PDFExtractor:
             line_blocks = sorted(blocks_by_y[y_pos], key=lambda b: b[0])  # Sort by x-coordinate
             sorted_blocks.extend(line_blocks)
         
-        # Reconstruct text with proper spacing
+        # Reconstruct text with proper spacing and simple column detection
         text_parts = []
         prev_block = None
         for block in sorted_blocks:
@@ -681,16 +681,19 @@ class PDFExtractor:
                 y_gap = block[1] - (prev_block[1] + prev_block[3])  # Current y - (prev y + prev height)
                 
                 # If significant vertical gap, add newline
-                if y_gap > 10:  # More than 10 pixels vertical gap
+                if y_gap > 10:
                     text_parts.append('\n')
-                # If significant horizontal gap, add space (likely new column or word)
-                elif x_gap > 20:  # More than 20 pixels horizontal gap
-                    text_parts.append(' ')
+                else:
+                    # Horizontal gap: decide between space or column break
+                    if x_gap > 40:  # Larger gap suggests a new column
+                        text_parts.append('\n')
+                    elif x_gap > 15:
+                        text_parts.append(' ')
             
             text_parts.append(block_text)
             prev_block = block
         
-        return ' '.join(text_parts)
+        return '\n'.join(text_parts)
     
     def _extract_and_format_tables_pdfplumber(self, tables: List, page) -> str:
         """Extract and format tables from pdfplumber with enhanced formatting."""

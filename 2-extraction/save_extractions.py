@@ -24,6 +24,17 @@ PDFExtractor = mod.PDFExtractor
 DEFAULT_PDF_INPUT_DIR = mod.DEFAULT_PDF_INPUT_DIR
 
 
+def get_quality_threshold(page_count: int) -> float:
+    """Dynamic OCR quality threshold based on PDF size.
+
+    Short papers tolerate lower scores, long papers demand higher confidence.
+    """
+    if page_count <= 5:
+        return 0.70
+    if page_count > 30:
+        return 0.90
+    return 0.85
+
 def main():
     input_dir: Path = DEFAULT_PDF_INPUT_DIR
     if not input_dir.is_dir():
@@ -32,10 +43,18 @@ def main():
 
     output_dir = Path("/Volumes/8SSD/paper/extracted_texts")
     output_dir.mkdir(parents=True, exist_ok=True)
-
+    # Open a simple JSON‑lines log for monitoring and an error log
+    import json, datetime
+    log_path = output_dir / "extraction_log.jsonl"
+    log_file = open(log_path, "a", encoding="utf-8")
+    error_log_path = output_dir / "extraction_errors.jsonl"
+    error_file = open(error_log_path, "a", encoding="utf-8")
     # Exclude hidden macOS resource‑fork files (those starting with '._')
-    pdf_files = [p for p in input_dir.rglob("*.pdf") if not p.name.startswith('._')][:100]
+    pdf_files = [p for p in input_dir.rglob("*.pdf") if not p.name.startswith('._')]
     print(f"Found {len(pdf_files)} PDF files in {input_dir}")
+
+    # Process in chunks to limit memory usage (e.g., 5 000 PDFs per chunk)
+    CHUNK_SIZE = 5000
 
     # Fast extractor (OCR disabled) for the first pass
     # ----------------------------------------------------------------------
@@ -44,18 +63,44 @@ def main():
     import os, concurrent.futures, multiprocessing as mp
 
     fast_extractor = PDFExtractor(enable_ocr=False)
-    OCR_QUALITY_THRESHOLD = 0.85   # Run OCR only when quality_score < 0.85
-    max_workers = max(1, min(4, (os.cpu_count() or 2) - 1))  # leave one core free
+    # Dynamic threshold function will be used per PDF
+    # Placeholder; actual threshold computed later based on page count
+    cpu_cnt = os.cpu_count() or 2
+    max_workers = max(1, cpu_cnt - 1)  # leave one core free
 
     def process_one(idx, pdf_path):
         try:
-            # ---- First extraction (fast) ----
-            result = fast_extractor.extract(str(pdf_path))
+            # ---- Cache check & first extraction (fast) ----
+            cache_key = fast_extractor._get_cache_key(pdf_path)
+            cached_meta = fast_extractor._load_from_cache(cache_key)
+            if cached_meta:
+                # Use cached page count (if present) to compute a dynamic OCR threshold
+                cached_pages = cached_meta.get('page_count')
+                if not cached_pages:
+                    # Fallback: estimate from file size (approx 1 page per 50 KB)
+                    try:
+                        size_kb = pdf_path.stat().st_size / 1024
+                        cached_pages = max(1, int(size_kb / 50))
+                    except Exception:
+                        cached_pages = 5
+                dyn_thresh_cached = get_quality_threshold(cached_pages)
+                if cached_meta.get('quality_score', 0) >= dyn_thresh_cached:
+                    # Cached high‑quality result exists – reuse metadata, but still need full text extraction for the actual content
+                    result = fast_extractor.extract(str(pdf_path))
+                else:
+                    # Cached entry below threshold – run fast extraction anyway (OCR may be triggered later)
+                    result = fast_extractor.extract(str(pdf_path))
+            else:
+                # No cache – run fast extraction
+                result = fast_extractor.extract(str(pdf_path))
             if not result.get("success"):
                 return f"{idx}/{len(pdf_files)} [WARN] Extraction reported failure for {pdf_path.name}", None
             # ---- Check quality, possibly redo with OCR ----
             q = result.get('quality_score', 0.0)
-            if q < OCR_QUALITY_THRESHOLD:
+            # Determine dynamic threshold based on page count (fallback to 5 pages if unknown)
+            page_cnt_est = len(result.get('pages', [])) or 5
+            dyn_thresh = get_quality_threshold(page_cnt_est)
+            if q < dyn_thresh:
                 ocr_extractor = PDFExtractor(enable_ocr=True)
                 ocr_result = ocr_extractor.extract(str(pdf_path))
                 if ocr_result.get('quality_score', 0.0) > q:
@@ -70,7 +115,7 @@ def main():
             result["text"] = clean_extra_headers(result["text"]) 
             import unicodedata
             result["text"] = unicodedata.normalize('NFKC', result["text"]) 
-            # ---- Table extraction (pdfplumber) ----
+            # ---- Table extraction (pdfplumber) with filtering ----
             tables = None
             try:
                 import pdfplumber
@@ -80,8 +125,24 @@ def main():
                         page_tables = page.extract_tables()
                         if page_tables:
                             all_tables.extend(page_tables)
-                    if all_tables:
-                        tables = all_tables
+                    # Filter out tiny tables (less than 2 rows or <3 columns) and deduplicate
+                    filtered = []
+                    seen_hashes = set()
+                    for tbl in all_tables:
+                        if not tbl:
+                            continue
+                        row_count = len(tbl)
+                        col_count = max((len(r) for r in tbl), default=0)
+                        if row_count < 2 or col_count < 3:
+                            continue
+                        # Simple deduplication by hash of stringified rows
+                        tbl_hash = hash(str(tbl))
+                        if tbl_hash in seen_hashes:
+                            continue
+                        seen_hashes.add(tbl_hash)
+                        filtered.append(tbl)
+                    if filtered:
+                        tables = filtered
             except Exception:
                 pass
             # ---- Build JSON data and write file ----
@@ -119,17 +180,46 @@ def main():
             }
             json_path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             msg = f"{idx}/{len(pdf_files)} OK  saved {json_path} ({result.get('metadata',{}).get('page_count','?')} pages, score={result.get('quality_score'):.3f})"
+            # Write monitoring entry
+            log_entry = {
+                "timestamp": datetime.datetime.utcnow().isoformat() + 'Z',
+                "pdf_path": str(pdf_path),
+                "output_json": str(json_path),
+                "page_count": result.get('metadata',{}).get('page_count'),
+                "quality_score": result.get('quality_score'),
+                "method_used": result.get('method_used'),
+                "ocr_used": result.get('pdf_type') == 'scanned' or (result.get('method_used') == 'ocr'),
+                "tables_extracted": bool(tables),
+                "status": "success"
+            }
+            log_file.write(json.dumps(log_entry) + '\n')
             return msg, None
         except Exception as e:
             return f"{idx}/{len(pdf_files)} [ERROR] {pdf_path.name}: {e}", None
 
-    # Run in a process pool (better for CPU‑bound OCR)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_one, i+1, p): (i+1, p) for i, p in enumerate(pdf_files)}
-        for fut in concurrent.futures.as_completed(futures):
-            msg, _ = fut.result()
-            if msg:
-                print(msg)
+    # Run in chunks with a thread pool (functions need to be picklable)
+    from tqdm import tqdm
+    for start in range(0, len(pdf_files), CHUNK_SIZE):
+        chunk = pdf_files[start:start + CHUNK_SIZE]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_one, i+1+start, p): (i+1+start, p)
+                       for i, p in enumerate(chunk)}
+            for fut in tqdm(concurrent.futures.as_completed(futures), total=len(chunk),
+                            desc=f"Processing PDFs {start + 1}-{min(start + CHUNK_SIZE, len(pdf_files))}"):
+                try:
+                    msg, _ = fut.result()
+                    if msg:
+                        print(msg)
+                except Exception as e:
+                    # Log unexpected future exception
+                    err_entry = {
+                        "timestamp": datetime.datetime.utcnow().isoformat() + 'Z',
+                        "error": str(e)
+                    }
+                    error_file.write(json.dumps(err_entry) + '\n')
+    # Close log files
+    log_file.close()
+    error_file.close()
 
 
 if __name__ == "__main__":
