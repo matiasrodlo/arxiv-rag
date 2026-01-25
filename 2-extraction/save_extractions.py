@@ -68,8 +68,137 @@ def main():
     cpu_cnt = os.cpu_count() or 2
     max_workers = max(1, cpu_cnt - 1)  # leave one core free
 
-    def process_one(idx, pdf_path):
+def process_one(idx, pdf_path):
+    # Skip already processed files based on existing JSON output
+    rel_path = pdf_path.relative_to(DEFAULT_PDF_INPUT_DIR).with_suffix('')
+    json_path = output_dir / rel_path.with_suffix('.json')
+    if json_path.is_file():
+        return f"{idx}/{len(pdf_files)} SKIP already processed {json_path}", None
+    try:
+        # ---- Cache check & first extraction (fast) ----
+        cache_key = fast_extractor._get_cache_key(pdf_path)
+        cached_meta = fast_extractor._load_from_cache(cache_key)
+        if cached_meta:
+            # Use cached page count (if present) to compute a dynamic OCR threshold
+            cached_pages = cached_meta.get('page_count')
+            if not cached_pages:
+                # Fallback: estimate from file size (approx 1 page per 50 KB)
+                try:
+                    size_kb = pdf_path.stat().st_size / 1024
+                    cached_pages = max(1, int(size_kb / 50))
+                except Exception:
+                    cached_pages = 5
+            dyn_thresh_cached = get_quality_threshold(cached_pages)
+            if cached_meta.get('quality_score', 0) >= dyn_thresh_cached:
+                # Cached high‑quality result exists – reuse metadata, but still need full text extraction for the actual content
+                result = fast_extractor.extract(str(pdf_path))
+            else:
+                # Cached entry below threshold – run fast extraction anyway (OCR may be triggered later)
+                result = fast_extractor.extract(str(pdf_path))
+        else:
+            # No cache – run fast extraction
+            result = fast_extractor.extract(str(pdf_path))
+        if not result.get("success"):
+            return f"{idx}/{len(pdf_files)} [WARN] Extraction reported failure for {pdf_path.name}", None
+        # ---- Check quality, possibly redo with OCR ----
+        q = result.get('quality_score', 0.0)
+        page_cnt_est = len(result.get('pages', [])) or 5
+        dyn_thresh = get_quality_threshold(page_cnt_est)
+        if q < dyn_thresh:
+            ocr_extractor = PDFExtractor(enable_ocr=True)
+            ocr_result = ocr_extractor.extract(str(pdf_path))
+            if ocr_result.get('quality_score', 0.0) > q:
+                result = ocr_result
+        # ---- Clean text ----
+        def clean_extra_headers(text: str) -> str:
+            import re
+            text = re.sub(r'^\s*\d+\s*$\n?', '', text, flags=re.MULTILINE)
+            text = re.sub(r'^(Proceedings|Conference|Workshop|©).*?\n', '', text,
+                          flags=re.IGNORECASE | re.MULTILINE)
+            return text
+        result["text"] = clean_extra_headers(result["text"]) 
+        import unicodedata
+        result["text"] = unicodedata.normalize('NFKC', result["text"]) 
+        # ---- Table extraction (pdfplumber) with filtering ----
+        tables = None
         try:
+            import pdfplumber
+            with pdfplumber.open(str(pdf_path)) as pdf:
+                all_tables = []
+                for page in pdf.pages:
+                    page_tables = page.extract_tables()
+                    if page_tables:
+                        all_tables.extend(page_tables)
+                filtered = []
+                seen_hashes = set()
+                for tbl in all_tables:
+                    if not tbl:
+                        continue
+                    row_count = len(tbl)
+                    col_count = max((len(r) for r in tbl), default=0)
+                    if row_count < 2 or col_count < 3:
+                        continue
+                    tbl_hash = hash(str(tbl))
+                    if tbl_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(tbl_hash)
+                    filtered.append(tbl)
+                if filtered:
+                    tables = filtered
+        except Exception:
+            pass
+        # ---- Build JSON data and write file ----
+        rel_path = pdf_path.relative_to(DEFAULT_PDF_INPUT_DIR).with_suffix('')
+        json_path = output_dir / rel_path.with_suffix('.json')
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        def _clean_str(s):
+            return s.strip() if isinstance(s, str) else s
+        meta = result.get("metadata", {}) or {}
+        normalized_meta = {
+            "title": _clean_str(meta.get("title", "")),
+            "author": _clean_str(meta.get("author", "")),
+            "subject": _clean_str(meta.get("subject", "")),
+            "creator": _clean_str(meta.get("creator", "")),
+            "producer": _clean_str(meta.get("producer", "")),
+            "creation_date": _clean_str(meta.get("creation_date", "")),
+            "modification_date": _clean_str(meta.get("modification_date", "")),
+            "page_count": meta.get("page_count")
+        }
+        if normalized_meta["title"]:
+            normalized_meta["title"] = normalized_meta["title"].title()
+        if normalized_meta["author"]:
+            normalized_meta["author"] = normalized_meta["author"].title()
+        data = {
+            "text": result["text"],
+            "metadata": normalized_meta,
+            "pages": result.get("pages", []),
+            "method_used": result.get("method_used"),
+            "quality_score": result.get("quality_score"),
+            "tables": tables,
+        }
+        json_path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        msg = f"{idx}/{len(pdf_files)} OK  saved {json_path} ({result.get('metadata',{}).get('page_count','?')} pages, score={result.get('quality_score'):.3f})"
+        log_entry = {
+            "timestamp": datetime.datetime.utcnow().isoformat() + 'Z',
+            "pdf_path": str(pdf_path),
+            "output_json": str(json_path),
+            "page_count": result.get('metadata',{}).get('page_count'),
+            "quality_score": result.get('quality_score'),
+            "method_used": result.get('method_used'),
+            "ocr_used": result.get('pdf_type') == 'scanned' or (result.get('method_used') == 'ocr'),
+            "tables_extracted": bool(tables),
+            "status": "success"
+        }
+        log_file.write(json.dumps(log_entry) + '\n')
+        return msg, None
+    except Exception as e:
+        return f"{idx}/{len(pdf_files)} [ERROR] {pdf_path.name}: {e}", None
+    rel_path = pdf_path.relative_to(DEFAULT_PDF_INPUT_DIR).with_suffix('')
+    json_path = output_dir / rel_path.with_suffix('.json')
+    if json_path.is_file():
+        return f"{idx}/{len(pdf_files)} SKIP already processed {json_path}", None
+    try:
             # ---- Cache check & first extraction (fast) ----
             cache_key = fast_extractor._get_cache_key(pdf_path)
             cached_meta = fast_extractor._load_from_cache(cache_key)
@@ -194,8 +323,8 @@ def main():
             }
             log_file.write(json.dumps(log_entry) + '\n')
             return msg, None
-        except Exception as e:
-            return f"{idx}/{len(pdf_files)} [ERROR] {pdf_path.name}: {e}", None
+    except Exception as e:
+        return f"{idx}/{len(pdf_files)} [ERROR] {pdf_path.name}: {e}", None
 
     # Run in chunks with a thread pool (functions need to be picklable)
     from tqdm import tqdm
