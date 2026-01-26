@@ -162,3 +162,9 @@ See [3-embeddings/README.md](3-embeddings/README.md) for details.
 ## Contributing
 
 [Add contribution guidelines here]
+
+## Recent Updates
+
+- Enhanced PDF extraction with improved OCR quality
+- Added chunk quality analysis tools
+- Optimized embedding generation for better performance
